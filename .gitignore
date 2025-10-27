@@ -127,3 +127,30 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+envs/sail-tf1b/venv-sail-tf1b.tar.gz
+# Python cache & venvs
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+.env
+
+# Editor/backup files
+*.bak*
+*~
+
+# TensorBoard logs (huge)
+**/tb/
+**/tb_logs/
+**/tb_logs_smoke/
+**/tensorboard/
+**/events.out.tfevents.*
+
+# Large training artifacts
+**/runs/
+**/exp_*/
+**/logs/
+**/checkpoints/
+**/models/

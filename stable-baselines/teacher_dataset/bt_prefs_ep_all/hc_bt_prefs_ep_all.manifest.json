@@ -1,0 +1,41 @@
+{
+  "n_items": 72,
+  "n_pairs": 2452,
+  "delta": 100.0,
+  "keep_near_ties": false,
+  "pairing": "all",
+  "max_pairs_requested": 0,
+  "balance_bins": 8,
+  "sources": [
+    "/nfs/turbo/umd-sridas/Soham/SAIL-tf1b/stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_100_episodes_4_legacy_exact.npz",
+    "/nfs/turbo/umd-sridas/Soham/SAIL-tf1b/stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_100_episodes_8_e002_legacy_exact.npz",
+    "/nfs/turbo/umd-sridas/Soham/SAIL-tf1b/stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_150_episodes_4_legacy_exact.npz",
+    "/nfs/turbo/umd-sridas/Soham/SAIL-tf1b/stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_150_episodes_8_e002_legacy_exact.npz",
+    "/nfs/turbo/umd-sridas/Soham/SAIL-tf1b/stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_300_episodes_4_legacy_exact.npz",
+    "/nfs/turbo/umd-sridas/Soham/SAIL-tf1b/stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_300_episodes_8_e002_legacy_exact.npz",
+    "/nfs/turbo/umd-sridas/Soham/SAIL-tf1b/stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_500_episodes_4_legacy_exact.npz",
+    "/nfs/turbo/umd-sridas/Soham/SAIL-tf1b/stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_500_episodes_8_e002_legacy_exact.npz",
+    "/nfs/turbo/umd-sridas/Soham/SAIL-tf1b/stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_50_episodes_4_legacy_exact.npz",
+    "/nfs/turbo/umd-sridas/Soham/SAIL-tf1b/stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_50_episodes_8_e002_legacy_exact.npz",
+    "/nfs/turbo/umd-sridas/Soham/SAIL-tf1b/stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_75_episodes_4_legacy_exact.npz",
+    "/nfs/turbo/umd-sridas/Soham/SAIL-tf1b/stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_75_episodes_8_e002_legacy_exact.npz"
+  ],
+  "tiers_present": [
+    50,
+    75,
+    100,
+    150,
+    300,
+    500
+  ],
+  "return_stats": {
+    "min": 202.76315307617188,
+    "max": 6988.27880859375,
+    "mean": 4277.029931386312
+  },
+  "gap_stats": {
+    "min": 100.9482421875,
+    "max": 6785.515625,
+    "mean": 1870.736572265625
+  }
+}

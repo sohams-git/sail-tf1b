@@ -15,6 +15,7 @@ try:
 except ImportError:
     pybullet_envs = None
 import numpy as np
+import torch
 import yaml
 try:
     import highway_env
@@ -85,7 +86,7 @@ def a2c_callback(log_dir, max_score, mode):
 
 def load_expert_hyperparams(args):
     with open('../hyperparams/{}.yml'.format(args.algo), 'r') as f:
-        hyperparams_dict = yaml.load(f)
+        hyperparams_dict = yaml.safe_load(f)
         if env_id in list(hyperparams_dict.keys()):
             hyperparams = hyperparams_dict[env_id]
         elif is_atari:
@@ -410,14 +411,40 @@ def eval_model(args, model, env, step=50000):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
+    parser.add_argument('--use-pref-critic', action='store_true', help='Use TD3Pref with BPref reward')
+
+    # --- Additive BPref -> discriminator reward (critic unchanged)
+    parser.add_argument(
+    "--add-pref-to-disc", action="store_true",
+    help="Add BPref reward to the discriminator reward; TD3 critic unchanged."
+)
+    parser.add_argument(
+    "--pref-weight", type=float, default=1.0,
+    help="Weight on normalized BPref reward when adding to discriminator reward."
+)
+    parser.add_argument(
+    "--pref-norm", type=str, default="zscore",
+    choices=["zscore", "iqr-match", "none"],
+    help="Normalization for BPref reward before weighting."
+)
+    parser.add_argument(
+    "--pref-clip", type=float, default=5.0,
+    help="Clip normalized BPref contribution to [-pref-clip, pref-clip]."
+)
+
+
+    parser.add_argument('--lambda-ref', type=float, default=0.0)
+    parser.add_argument('--pref-rm', type=str, default=None)
+    parser.add_argument('--pref-expect-obs-dim', type=int, default=17)
+
     parser.add_argument('--env', type=str, default="PongNoFrameskip-v4", help='environment ID')
     parser.add_argument('-tb', '--tensorboard-log', help='Tensorboard log dir', default='tb_logs', type=str)
     parser.add_argument('-i', '--trained-agent', help='Path to a pretrained agent to continue training',
-                        default='', type=str)
+default='', type=str)
     parser.add_argument('--algo', help='RL Algorithm', default='dqnrrs',
-                        type=str, required=False, choices=list(ALGOS.keys()))
+type=str, required=False, choices=list(ALGOS.keys()))
     parser.add_argument('-n', '--n-timesteps', help='Overwrite the number of timesteps', default=-1,
-                        type=int)
+type=int)
     parser.add_argument('--log-interval', help='Override log interval (default: -1, no change)', default=1000,
                         type=int)
     parser.add_argument('-f', '--log-folder', help='Log folder', type=str, default='logs')
@@ -443,6 +470,20 @@ if __name__ == '__main__':
         default='train',
         help='Figure it out yourself.╭(╯^╰)╮')
     args = parser.parse_args()
+
+    ##__PREF_INIT__
+    rm = None
+    if getattr(args, 'use_pref_critic', False):
+        from stable_baselines.common.pref_rm_eval import PrefRewardModel
+        from stable_baselines.td3.td3_pref import TD3Pref
+        rm = PrefRewardModel(args.pref_rm, expect_obs_dim=args.pref_expect_obs_dim)
+        from stable_baselines.td3.td3 import TD3 as _TD3
+        TD3 = TD3Pref  # swap class only for this run
+        print('[SAIL] Using TD3Pref with', args.pref_rm, 'lambda_ref=', args.lambda_ref)
+    else:
+        print('[SAIL] Using vanilla TD3 (no pref critic)')
+if args.add_pref_to_disc:
+    print('[SAIL] Additive BPref->Discriminator enabled (critic unchanged)')
 
     # build log_dir
     # $prefix/$task/$algo/$env/rank$seed"
@@ -497,6 +538,9 @@ if __name__ == '__main__':
     # Load hyperparameters & create environment
     #############################################
     hyperparams, saved_hyperparams = load_expert_hyperparams(args)
+    # ensure TB path comes from CLI
+    hyperparams['tensorboard_log'] = args.tensorboard_log
+
     # replace str in hyperparams to be real entities
     hyperparams = initiate_hyperparams(args, hyperparams)
     # Should we overwrite the number of timesteps?
@@ -511,6 +555,17 @@ if __name__ == '__main__':
     config = CONFIGS[args.env]
     config['n_episodes'] = args.n_episodes
     config['sparse'] = False
+
+    # >>> Additive BPref->Disc settings (only used if --add-pref-to-disc is set)
+    config['add_pref_to_disc'] = bool(args.add_pref_to_disc)
+    if config['add_pref_to_disc']:
+        # pass everything the algo needs; no critic changes required
+        config['pref_rm_path'] = args.pref_rm
+        config['pref_expect_obs_dim'] = args.pref_expect_obs_dim
+        config['pref_weight'] = args.pref_weight
+        config['pref_norm'] = args.pref_norm          # 'zscore' | 'iqr-match' | 'none'
+        config['pref_clip'] = args.pref_clip          # e.g., 5.0
+# <<< end additive settings
     #args.log_dir = args.log_dir.replace('eval-bc', 'eval-bc-episode-{}'.format(config['n_episodes']))  
     os.makedirs(args.log_dir, exist_ok=True)
     env, hyperparams, normalize = create_env(args, hyperparams, n_timesteps)
@@ -581,7 +636,6 @@ if __name__ == '__main__':
     model = ALGOS[args.algo](
         policy,
         env=env,
-        tensorboard_log=tensorboard_log,
         verbose=args.verbose,
         expert_data_path=data_save_dir,
         **hyperparams)
@@ -635,8 +689,7 @@ if __name__ == '__main__':
             n_epochs=100 * config['n_episodes'],
             learning_rate=1e-3,
             adam_epsilon=1e-8,
-            val_interval=None,
-            )
+            val_interval=None)
     else:
         print(config)
         time.sleep(3)

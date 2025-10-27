@@ -1,0 +1,451 @@
+Yep—let’s train 1500, 3000, and 5600-episode TD3 teachers (vanilla SB1) and save both the checkpoints and the datasets into a timestamped folder (so nothing gets overwritten).
+
+# ---- 0) Activate the right venv (vanilla SB1 installed here) ----
+source ~/.venvs/sb-tf1-clean/bin/activate
+python -V   # should be 3.7.x
+
+# ---- 1) MuJoCo + EGL + GLEW + patchelf env ----
+export MUJOCO_GL=egl
+export MUJOCO_PY_MUJOCO_PATH="$HOME/.mujoco/mujoco210"
+export LD_LIBRARY_PATH="$HOME/.mujoco/mujoco210/bin:${LD_LIBRARY_PATH:-}"
+
+# If you installed GLEW locally:
+export GLEW_ROOT="$HOME/.local/glew-2.1.0"
+export C_INCLUDE_PATH="$GLEW_ROOT/include:${C_INCLUDE_PATH:-}"
+export LIBRARY_PATH="$GLEW_ROOT/lib64:$GLEW_ROOT/lib:${LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="$GLEW_ROOT/lib64:$GLEW_ROOT/lib:${LD_LIBRARY_PATH:-}"
+
+# Help mujoco-py find EGL/NVIDIA bits if they exist on your node:
+for p in /lib64 /usr/lib64 /usr/lib /usr/lib/x86_64-linux-gnu \
+         /usr/lib64/nvidia /usr/lib/nvidia /usr/lib/nvidia-* /usr/lib/x86_64-linux-gnu/nvidia*; do
+  [ -d "$p" ] && LD_LIBRARY_PATH="$LD_LIBRARY_PATH:$p"
+done
+export LD_LIBRARY_PATH
+
+# patchelf (needed by mujoco-py)
+export PATH="$HOME/.local/patchelf-0.18.0/bin:$PATH"
+
+# ---- 2) Sanity-check we’re on pip’s Stable-Baselines TD3 (not the fork) ----
+python - <<'PY'
+import inspect, stable_baselines
+from stable_baselines import TD3
+print("stable_baselines:", stable_baselines.__file__)
+print("TD3 from        :", inspect.getsourcefile(TD3))
+PY
+
+# ---- 3) Train teachers for 1500, 3000, 5600 episodes and save outputs ----
+export SAVE_DIR="stable-baselines/teacher_dataset/run_$(date +%Y%m%d-%H%M%S)"
+python stable-baselines/scripts/make_halfcheetah_teachers_tf1.py \
+  --episodes 750 \
+  --n_trajs 4 \
+  --save_dir "$SAVE_DIR" \
+  --seed 42
+
+echo "Outputs in: $SAVE_DIR"
+ls -lh "$SAVE_DIR"
+
+# ---- 4) Quick per-file return stats (just to confirm they’re sane/positive) ----
+python - <<'PY'
+import os, glob, numpy as np
+save_dir = os.environ["SAVE_DIR"]
+paths = sorted(glob.glob(os.path.join(save_dir, "*.npz")))
+for p in paths:
+    d = np.load(p, allow_pickle=True)
+    R = d["episode_returns"].astype(float)
+    print(os.path.basename(p))
+    print("  steps =", d["observations"].shape[0],
+          "episodes =", R.shape[0],
+          "mean/min/max =", f"{R.mean():.2f}/{R.min():.2f}/{R.max():.2f}")
+PY
+
+export SAVE_DIR="stable-baselines/teacher_dataset/run_$(date +%Y%m%d-%H%M%S)"
+python stable-baselines/scripts/make_halfcheetah_teachers_tf1.py \
+  --episodes 150 300 \
+  --n_trajs 4 \
+  --save_dir "$SAVE_DIR" \
+  --seed 42
+
+
+here’s a single command that finds and summarizes expert_data_no_img_HalfCheetah_scores_1500_episodes_4.npz (works whether it’s directly in stable-baselines/teacher_dataset/ or inside a timestamped subfolder). Run it in your repo root:
+
+
+python - <<'PY'
+import os, glob, numpy as np, sys
+
+name = "expert_data_no_img_HalfCheetah_scores_300_episodes_4.npz"
+# If you pass a full path as an arg, we use that; otherwise search common dirs.
+paths = [sys.argv[1]] if len(sys.argv) > 1 else sorted(set(
+    glob.glob(os.path.join("stable-baselines/teacher_dataset", "**", name), recursive=True) +
+    glob.glob(name)
+))
+if not paths:
+    print("Not found:", name); raise SystemExit(1)
+
+def compute_returns(d):
+    if "episode_returns" in d:
+        return np.asarray(d["episode_returns"], dtype=float).reshape(-1)
+    rew = np.asarray(d.get("rewards", [])).reshape(-1)
+    if rew.size == 0: return np.array([], dtype=float)
+    if "episode_ids" in d:
+        ids = np.asarray(d["episode_ids"]).reshape(-1)
+        R = np.zeros(int(ids.max())+1 if ids.size else 0, dtype=float)
+        np.add.at(R, ids, rew)
+        return R
+    if "episode_starts" in d:
+        starts = np.asarray(d["episode_starts"]).astype(bool).reshape(-1)
+        idx = np.nonzero(starts)[0].tolist() + [len(rew)]
+        return np.array([rew[a:b].sum() for a,b in zip(idx[:-1], idx[1:])], dtype=float)
+    return np.array([rew.sum()], dtype=float)
+
+for p in paths:
+    d = np.load(p, allow_pickle=True)
+    keys = list(d.keys())
+    obs_key = "observations" if "observations" in d else ("obs" if "obs" in d else None)
+    act_key = "actions" if "actions" in d else None
+    obs_shape = d[obs_key].shape if obs_key else None
+    act_shape = d[act_key].shape if act_key else None
+    steps = (obs_shape[0] if obs_shape else (d["rewards"].shape[0] if "rewards" in d else None))
+    R = compute_returns(d)
+
+    print(f"\nfile: {p}")
+    print("realpath:", os.path.realpath(p))
+    print("keys:", keys)
+    if obs_shape: print(f"  observations shape={obs_shape}  obs_dim={obs_shape[-1]}")
+    if act_shape: print(f"  actions      shape={act_shape}  act_dim={act_shape[-1]}")
+    print(f"steps: {steps}")
+    print(f"episodes: {len(R)}")
+    if R.size:
+        q25,q50,q75 = np.percentile(R, [25,50,75])
+        print(f"return stats: mean={R.mean():.2f}  min={R.min():.2f}  max={R.max():.2f}  "
+              f"median={q50:.2f}  p25={q25:.2f}  p75={q75:.2f}")
+        m = min(4, len(R))
+        print("returns first:", np.array2string(R[:m], precision=2, separator=' '))
+        print("returns last :", np.array2string(R[-m:], precision=2, separator=' '))
+    else:
+        print("return stats: (no episode_returns available)")
+PY
+
+
+one shot convertor to legacy 
+
+# from /nfs/turbo/umd-sridas/Soham/SAIL-tf1b
+python - <<'PY'
+import numpy as np, os
+
+def convert_to_legacy(in_path, out_path, max_ep_len=1000):
+    f = np.load(in_path, allow_pickle=True)
+    # required inputs
+    obs17   = f["observations"].astype(np.float32)     # (N,17)
+    acts    = f["actions"].astype(np.float32)          # (N,6)
+    rews    = f["rewards"].astype(np.float32).reshape(-1,1)  # (N,1)
+    ep_rets = f["episode_returns"]                      # (E,)
+
+    # build episode_starts from episode_lengths if available, else uniform 1000
+    if "episode_lengths" in f:
+        lens = f["episode_lengths"].astype(int)
+    else:
+        n = len(obs17)
+        E = len(ep_rets)
+        lens = np.array([n // E] * E, dtype=int)
+
+    # episode_starts mask and per-step t index
+    starts = np.zeros(len(obs17), dtype=bool)
+    t_within = np.zeros(len(obs17), dtype=np.int32)
+    idx = 0
+    for L in lens:
+        starts[idx] = True
+        t_within[idx:idx+L] = np.arange(L, dtype=np.int32)
+        idx += L
+
+    # add time feature to match legacy obs_dim=18 (TimeFeatureWrapper style: 1 - t/1000)
+    time_feat = 1.0 - (t_within.astype(np.float32) / float(max_ep_len))
+    obs18 = np.concatenate([obs17, time_feat[:,None]], axis=1)
+
+    # write legacy file
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    np.savez_compressed(
+        out_path,
+        obs=obs18.astype(np.float32),
+        actions=acts.astype(np.float32),
+        rewards=rews.astype(np.float32),
+        episode_returns=ep_rets.astype(np.float64),
+        episode_starts=starts.astype(object)   # matches your original 5600 file dtype
+    )
+
+    # quick print
+    g = np.load(out_path, allow_pickle=True)
+    print(f"[OK] {out_path}")
+    print("  keys:", list(g.keys()))
+    print("  shapes:", {k:g[k].shape for k in g})
+    print("  obs_dim:", g["obs"].shape[1], "act_dim:", g["actions"].shape[1])
+    print("  returns min/mean/max:",
+          float(g["episode_returns"].min()),
+          float(g["episode_returns"].mean()),
+          float(g["episode_returns"].max()))
+    print()
+
+# === convert your 5 new teachers ===
+in_files = [
+  "teacher_dataset/expert_data_no_img_HalfCheetah_scores_50_episodes_8_e002.npz",
+  "teacher_dataset/expert_data_no_img_HalfCheetah_scores_75_episodes_8_e002.npz",
+  "teacher_dataset/expert_data_no_img_HalfCheetah_scores_100_episodes_8_e002.npz",
+  "teacher_dataset/expert_data_no_img_HalfCheetah_scores_150_episodes_8_e002.npz",
+  "teacher_dataset/expert_data_no_img_HalfCheetah_scores_300_episodes_8_e002.npz",
+  "teacher_dataset/expert_data_no_img_HalfCheetah_scores_500_episodes_8_e002.npz"
+]
+for p in in_files:
+    base = os.path.basename(p).replace(".npz", "_legacy_exact.npz")
+    out  = os.path.join("stable-baselines/teacher_dataset/legacy", base)
+    convert_to_legacy(p, out)
+PY
+
+
+
+point it to the matching file name becoz train_sail.py builds the demo file path 
+So create that file (or a symlink) that points to your legacy-exact 3000-episode dataset:
+
+# paths
+cd /nfs/turbo/umd-sridas/Soham/SAIL-tf1b
+SRC="stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_150_500_mix_episodes_4_legacy_exact.npz"
+DST="teacher_dataset/expert_data_no_img_HalfCheetah_scores_5600_episodes_4.npz"
+
+mkdir -p "$(dirname "$DST")"
+ln -sf "$PWD/$SRC" "$PWD/$DST"
+
+# sanity: should resolve to the 150-episode file
+python - <<'PY'
+import os, numpy as np
+p="teacher_dataset/expert_data_no_img_HalfCheetah_scores_5600_episodes_4.npz"
+print("realpath:", os.path.realpath(p))
+f=np.load(p, allow_pickle=True)
+print("steps:", len(f['rewards']), "episodes:", len(f['episode_returns']))
+print("returns min/mean/max:",
+      float(f['episode_returns'].min()),
+      float(f['episode_returns'].mean()),
+      float(f['episode_returns'].max()))
+PY
+
+cd stable-baselines/run
+python train_sail.py \
+  --env HalfCheetah-v2 --algo sail --seed 3 \
+  --task gail-lfd-adaptive-dynamic \
+  --n-timesteps -1 --n-episodes 4 \
+  --log-dir ~/sail_logs/150_500
+
+
+cd stable-baselines/run
+python train_sail.py \
+  --env HalfCheetah-v2 --algo sail --seed 3 \
+  --task gail-lfd-adaptive-dynamic \
+  --n-timesteps -1 --n-episodes 4 \
+  --log-dir "$HOME/sail_logs/150"
+
+
+  Yep — open a **new terminal**. Don’t touch the one that’s training.
+
+Here’s the clean, no-risk way:
+
+1. **In the training terminal (don’t stop it):**
+
+   ```bash
+   hostname -f    # note the compute host, e.g. gl1234.arc-ts.umich.edu
+   ```
+
+   (This tells you where your job is actually running.)
+
+2. **New SSH session to that same compute node:**
+
+   ```bash
+   # if you need your env:
+   source ~/.venvs/sail-tf1b/bin/activate   # or module load/conda activate
+   # free the port if needed, then start TB
+   lsof -ti:6006 | xargs -r kill -9
+   tensorboard --logdir ~/sail_logs --host 127.0.0.1 --port 6006 &
+   ```
+
+3. **From your laptop, another new terminal to create the tunnel:**
+
+   ```bash
+   ssh -N -L 6006:localhost:6006 \
+     -J USER@login.greatlakes.arc-ts.umich.edu \
+     USER@gl1234.arc-ts.umich.edu
+   ```
+
+   Then open: [http://localhost:6006](http://localhost:6006)
+
+Notes:
+
+* If `tensorboard` isn’t found in the new shell, activate the **same env** you used to train, or `pip install tensorboard` there.
+* If 6006 is busy, use 6007 (change it in both TB and the `-L` command).
+* You can also do this in **VS Code Remote-SSH**: connect to the **compute node**, start TB there, then use the **PORTS** panel → “Forward 6006”.
+
+This way your training keeps running, and you just spin up the viewer and tunnel alongside it.
+
+
+
+
+
+python - <<'PY'
+import os, numpy as np
+
+p = "/nfs/turbo/umd-sridas/Soham/SAIL-tf1b/stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_150_500_mix_episodes_4_legacy_exact.npz"
+d = np.load(p, allow_pickle=True)
+
+def compute_returns(d):
+    if "episode_returns" in d:
+        return np.asarray(d["episode_returns"], dtype=float).reshape(-1)
+    rew = np.asarray(d.get("rewards", [])).reshape(-1)
+    if rew.size == 0: return np.array([], dtype=float)
+    if "episode_starts" in d:
+        starts = np.asarray(d["episode_starts"]).astype(bool).reshape(-1)
+        idx = np.nonzero(starts)[0].tolist() + [len(rew)]
+        return np.array([rew[a:b].sum() for a,b in zip(idx[:-1], idx[1:])], dtype=float)
+    return np.array([rew.sum()], dtype=float)
+
+keys = list(d.keys())
+obs_key = "observations" if "observations" in d else ("obs" if "obs" in d else None)
+act_key = "actions" if "actions" in d else None
+obs_shape = d[obs_key].shape if obs_key else None
+act_shape = d[act_key].shape if act_key else None
+steps = (obs_shape[0] if obs_shape else (d["rewards"].shape[0] if "rewards" in d else None))
+R = compute_returns(d)
+
+print(f"\nfile: {p}")
+print("realpath:", os.path.realpath(p))
+print("keys:", keys)
+if obs_shape: print(f"  observations shape={obs_shape}  obs_dim={obs_shape[-1]}")
+if act_shape: print(f"  actions      shape={act_shape}  act_dim={act_shape[-1]}")
+print(f"steps: {steps}")
+print(f"episodes: {len(R)}")
+if R.size:
+    q25,q50,q75 = np.percentile(R, [25,50,75])
+    print(f"return stats: mean={R.mean():.2f}  min={R.min():.2f}  max={R.max():.2f}  median={q50:.2f}  p25={q25:.2f}  p75={q75:.2f}")
+    m = min(4, len(R))
+    print("returns first:", np.array2string(R[:m], precision=2, separator=' '))
+    print("returns last :", np.array2string(R[-m:], precision=2, separator=' '))
+else:
+    print("return stats: (no episode_returns available)")
+PY
+
+
+
+
+cat > /nfs/turbo/umd-sridas/Soham/SAIL-tf1b/stable-baselines/scripts/dump_td3_trajs.py << 'PY'
+
+
+python scripts/dump_td3_trajs.py \
+  --model teacher_dataset/run_20250910-212549/HalfCheetah-v2_50eps_td3.zip\
+  --out teacher_dataset/expert_data_no_img_HalfCheetah_scores_50_episodes_8_e002.npz \
+  --env HalfCheetah-v2 --episodes 8 --steps-per-ep 1000  --epsilon 0.02
+
+
+
+python - << 'PY'
+import numpy as np, json, collections
+npz = np.load("/nfs/turbo/umd-sridas/Soham/SAIL-tf1b/stable-baselines/teacher_dataset/bt_prefs_ep_all/hc_bt_prefs_ep_all.npz", allow_pickle=True)
+items = list(npz["items"])
+i_idx, j_idx, y = npz["i_idx"], npz["j_idx"], npz["y"]
+within = cross = 0
+for ii, jj in zip(i_idx, j_idx):
+    a, b = items[int(ii)], items[int(jj)]
+    if a["tier"] == b["tier"]:
+        within += 1
+    else:
+        cross  += 1
+print("Total pairs:", len(i_idx))
+print("Within-tier pairs:", within)
+print("Cross-tier pairs:", cross)
+assert within > 0 and cross > 0, "Expected both within and cross-tier pairs."
+print("OK: both within and cross-tier comparisons present.")
+PY
+
+
+OUT_DIR="/nfs/turbo/umd-sridas/Soham/SAIL-tf1b/stable-baselines/teacher_dataset/bt_prefs_ep_all"
+python scripts/make_bt_prefs.py \
+  --sources \
+  /nfs/turbo/umd-sridas/Soham/SAIL-tf1b/stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_50_episodes_8_e002_legacy_exact.npz \
+  /nfs/turbo/umd-sridas/Soham/SAIL-tf1b/stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_75_episodes_8_e002_legacy_exact.npz \
+  /nfs/turbo/umd-sridas/Soham/SAIL-tf1b/stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_100_episodes_8_e002_legacy_exact.npz \
+  /nfs/turbo/umd-sridas/Soham/SAIL-tf1b/stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_150_episodes_8_e002_legacy_exact.npz \
+  /nfs/turbo/umd-sridas/Soham/SAIL-tf1b/stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_300_episodes_8_e002_legacy_exact.npz \
+  /nfs/turbo/umd-sridas/Soham/SAIL-tf1b/stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_500_episodes_8_e002_legacy_exact.npz \
+  /nfs/turbo/umd-sridas/Soham/SAIL-tf1b/stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_50_episodes_4_legacy_exact.npz\
+  /nfs/turbo/umd-sridas/Soham/SAIL-tf1b/stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_75_episodes_4_legacy_exact.npz\
+  /nfs/turbo/umd-sridas/Soham/SAIL-tf1b/stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_100_episodes_4_legacy_exact.npz\
+  /nfs/turbo/umd-sridas/Soham/SAIL-tf1b/stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_150_episodes_4_legacy_exact.npz\
+  /nfs/turbo/umd-sridas/Soham/SAIL-tf1b/stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_300_episodes_4_legacy_exact.npz\
+  /nfs/turbo/umd-sridas/Soham/SAIL-tf1b/stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_500_episodes_4_legacy_exact.npz\
+  --out_jsonl "$OUT_DIR/hc_bt_prefs_ep_all.jsonl" \
+  --out_npz   "$OUT_DIR/hc_bt_prefs_ep_all.npz" \
+  --delta 100 \
+  --pairing all \
+  --max_pairs 0 \
+  --seed 42
+
+
+
+
+run the sail for multiple runs:
+
+# 3) Run 3 trials SEQUENTIALLY, each for exactly 100,000 timesteps
+for trial in 1 2 3; do
+  seed=$((1000*trial + 7))  # 1007, 2007, 3007
+  echo "[run] $LABEL  trial=$trial  seed=$seed  timesteps=1000000"
+
+  # IMPORTANT: run from the folder where ../hyperparams/sail.yml resolves
+  pushd "$REPO/stable-baselines/run" >/dev/null
+
+  python train_sail.py \
+    --env HalfCheetah-v2 \
+    --algo sail \
+    --seed "$seed" \
+    --task gail-lfd-adaptive-dynamic \
+    --n-timesteps 1000000 \
+    --n-episodes -1 \
+    --log-dir "$LOGROOT/$LABEL/run${trial}"
+
+  popd >/dev/null
+  echo "[logged] $LOGROOT/$LABEL/run${trial}"
+done
+
+
+
+
+
+
+source ~/venvs/pref37/bin/activate
+
+
+
+(sail-tf1b) [sohams@gl1020 SAIL-tf1b]$ git checkout -b feat/ref_l2_pref_rm
+Switched to a new branch 'feat/ref_l2_pref_rm'
+
+
+find /nfs/turbo/umd-sridas/Soham/SAIL-tf1b -type f -name 'td3_pref.py' 2>/dev/null
+
+cd /nfs/turbo/umd-sridas/Soham/SAIL-tf1b/stable-baselines/run
+PYTHONPATH="$PWD/.." python train_sail.py \
+  --env HalfCheetah-v2 \
+  --algo sail \
+  --task gail-lfd-adaptive-dynamic \
+  --seed 0 \
+  --n-timesteps 1000000 \
+  --use-pref-critic \
+  --pref-rm /nfs/turbo/umd-sridas/Soham/SAIL-tf1b/third_party/BPref/out/hc_pref_reward_v1.npz \
+  --lambda-ref 0.10 \
+  --pref-expect-obs-dim 18
+
+
+
+
+source ~/.venvs/bpref-py36/bin/activate
+
+
+Pearson correlation (~0.15): measures linear association between episode sums of your learned reward (pred_return) and the true env return. +1 = perfect linear alignment, 0 = no linear relation, −1 = perfect inverse.
+→ 0.15 = weak positive linear relation in this setting.
+Spearman correlation (~0.11): Pearson computed on the ranks (i.e., it checks if episodes that rank higher by your learned reward also rank higher by true return). It’s insensitive to monotonic rescaling.
+→ 0.11 = very weak monotonic agreement (barely above chance) across these 25 random-rollout episodes.
+Linear fit T ≈ 0.195·P − 118.7: on average, you can map your learned reward sum P to the env return T with that line. The small slope tells you the two totals vary together only weakly in this distribution.
+
+
+/nfs/turbo/umd-sridas/Soham/SAIL-tf1b

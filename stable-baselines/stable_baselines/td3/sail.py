@@ -970,13 +970,124 @@ class SAIL(OffPolicyRLModel):
         return bonus
 
     def get_imitate_reward(self, observation, action, true_reward, if_demo):
+
+        # base discriminator reward (GAIL/AIRL unchanged)
+
         _, p = self.discriminator.get_confidence(observation, action, sess=self.sess)
+
         mode = self.config['shaping_mode']
+
         if 'airl' in mode:
+
             p = np.clip(p, 1e-2, 1 - 1e-2)
-            return np.log( np.clip(p /(1 - p), 1e-3, 1e3)) / 10
+
+            r_gail = np.log(np.clip(p / (1 - p), 1e-3, 1e3)) / 10
+
         else:
-            return - np.log(1 - p + 1e-8)
+
+            r_gail = - np.log(1 - p + 1e-8)
+
+    
+
+        # Optionally add preference-model reward to discriminator reward
+
+        if self.config.get('add_pref_to_disc', False):
+
+            try:
+
+                # lazy-load pref RM once
+
+                if not hasattr(self, "_pref_add_rm"):
+
+                    self._pref_add_rm = None
+
+                    self._pref_add_err_once = False
+
+                    self._pref_add_loaded_banner = False
+
+                if self._pref_add_rm is None and not self._pref_add_err_once:
+
+                    path = self.config.get('pref_rm_path', None)
+
+                    if path:
+
+                        from stable_baselines.common.pref_rm_eval import PrefRewardModel
+
+                        expect = int(self.config.get('pref_expect_obs_dim', 17))
+
+                        self._pref_add_rm = PrefRewardModel(path, expect_obs_dim=expect)
+
+                        if not self._pref_add_loaded_banner:
+
+                            print("[SAIL:add-pref-to-disc] Loaded pref RM:", path, "norm=", self.config.get('pref_norm', 'zscore'), "weight=", self.config.get('pref_weight', 1.0), "clip=", self.config.get('pref_clip', 5.0))
+
+                            self._pref_add_loaded_banner = True
+
+                    else:
+
+                        self._pref_add_err_once = True
+
+    
+
+                if self._pref_add_rm is not None:
+
+                    # BPref supports (obs) or (obs, act) or (obs, act, next_obs). We pass (obs, act).
+
+                    r_pref = self._pref_add_rm.reward(observation, action)
+
+                    r_pref = np.asarray(r_pref).reshape(-1)  # shape (N,)
+
+    
+
+                    norm = self.config.get('pref_norm', 'zscore')
+
+                    if norm == 'zscore':
+
+                        mu, sd = float(np.mean(r_pref)), float(np.std(r_pref))
+
+                        r_pref = (r_pref - mu) / (sd + 1e-8)
+
+                    elif norm == 'iqr-match':
+
+                        # match IQR scale of r_gail
+
+                        rg = np.asarray(r_gail).reshape(-1)
+
+                        q75p, q25p = np.percentile(r_pref, 75), np.percentile(r_pref, 25)
+
+                        q75g, q25g = np.percentile(rg, 75), np.percentile(rg, 25)
+
+                        iqr_p = (q75p - q25p) + 1e-8
+
+                        iqr_g = (q75g - q25g)
+
+                        med_p = 0.5 * (q75p + q25p)
+
+                        r_pref = (r_pref - med_p) * (iqr_g / iqr_p)
+
+                    # else: 'none' → no normalization
+
+    
+
+                    clip_v = float(self.config.get('pref_clip', 5.0))
+
+                    r_pref = np.clip(r_pref, -clip_v, clip_v)
+
+                    w = float(self.config.get('pref_weight', 1.0))
+
+                    r_gail = np.asarray(r_gail).reshape(-1) + w * r_pref
+
+            except Exception as e:
+
+                if not getattr(self, "_pref_add_err_once", False):
+
+                    print("[SAIL:add-pref-to-disc] WARNING: falling back to pure disc reward due to:", e)
+
+                    self._pref_add_err_once = True
+
+    
+
+        return r_gail
 
 
     def combine_both_rewards(self, rewards, true_rewards, step, coeff=1):
