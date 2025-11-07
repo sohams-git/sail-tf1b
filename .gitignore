@@ -154,3 +154,6 @@ venv/
 **/logs/
 **/checkpoints/
 **/models/
+# Slurm job logs
+slurm_*.out
+slurm_*.err

@@ -482,8 +482,8 @@ type=int)
         print('[SAIL] Using TD3Pref with', args.pref_rm, 'lambda_ref=', args.lambda_ref)
     else:
         print('[SAIL] Using vanilla TD3 (no pref critic)')
-if args.add_pref_to_disc:
-    print('[SAIL] Additive BPref->Discriminator enabled (critic unchanged)')
+    if args.add_pref_to_disc:
+        print('[SAIL] Additive BPref->Discriminator enabled (critic unchanged)')
 
     # build log_dir
     # $prefix/$task/$algo/$env/rank$seed"
