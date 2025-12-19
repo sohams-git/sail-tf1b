@@ -449,3 +449,39 @@ Linear fit T ≈ 0.195·P − 118.7: on average, you can map your learned reward
 
 
 /nfs/turbo/umd-sridas/Soham/SAIL-tf1b
+
+
+
+
+# Pick which new dataset you want to point at (choose one)
+
+NEW1500="stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_1500_episodes_4_legacy_exact.npz"
+NEW7000="stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_7000_episodes_4_legacy_exact.npz"
+NEW100="/nfs/turbo/umd-sabymath/Soham/sail-tf1b/stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_100_episodes_4_legacy_exact.npz"
+# The link we’re repointing:
+LINK="teacher_dataset/expert_data_no_img_HalfCheetah_scores_5600_episodes_4.npz"
+
+# Backup the current real file if it’s not already a symlink
+[ ! -L "$LINK" ] && mv -n "$LINK" "${LINK}.bak"
+
+# Repoint to (say) the 100-episode file
+ln -sf "$PWD/$NEW100" "$PWD/$LINK"
+
+# Verify where it points
+ls -l "$LINK"
+readlink -f "$LINK"
+
+# Quick sanity check of what SAIL will read
+python - <<'PY'
+import os, numpy as np
+p="teacher_dataset/expert_data_no_img_HalfCheetah_scores_5600_episodes_4.npz"
+print("realpath:", os.path.realpath(p))
+f=np.load(p, allow_pickle=True)
+print("keys:", list(f.keys()))
+print("obs", f['obs'].shape, "actions", f['actions'].shape, "rewards", f['rewards'].shape)
+print("episodes:", len(f['episode_returns']), "steps:", len(f['rewards']))
+print("returns min/mean/max:",
+      float(f['episode_returns'].min()),
+      float(f['episode_returns'].mean()),
+      float(f['episode_returns'].max()))
+PY

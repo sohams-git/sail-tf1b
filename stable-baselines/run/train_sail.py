@@ -17,6 +17,9 @@ except ImportError:
 import numpy as np
 import torch
 import yaml
+
+import wandb
+
 try:
     import highway_env
 except ImportError:
@@ -54,7 +57,7 @@ def check_if_atari(env_id):
                 no_skip = True
             return is_atari, no_skip
 
-def a2c_callback(log_dir, max_score, mode):
+def a2c_callback(log_dir, max_score, mode, R_random=None, R_expert=None):
     def callback(_locals, _globals):
         """
         Callback called at each step (for DQN an others) or after n steps (see ACER or PPO2)
@@ -62,21 +65,82 @@ def a2c_callback(log_dir, max_score, mode):
         :param _globals: (dict)
         """
         global n_steps, best_mean_reward
-        # Print stats every 20 calls
+        # Print stats every 500 calls
         if (n_steps + 1) % 500 == 0:
-            # Evaluate policy training performance
+            # Evaluate policy training performance from Monitor logs
             x, y = ts2xy(load_results(log_dir), 'timesteps')
             if len(x) > 0:
-                mean_reward = np.mean(y[-100:])
-                print(x[-1], 'timesteps')
-                print("Best mean reward: {:.2f} - Last mean reward per episode: {:.2f}".format(best_mean_reward, mean_reward))
+                mean_reward = float(np.mean(y[-100:]))
+                current_step = int(x[-1])
+                print(current_step, 'timesteps')
+                print("Best mean reward: {:.2f} - Last mean reward per episode: {:.2f}".format(
+                    best_mean_reward, mean_reward
+                ))
 
-                # New best model, you could save the agent here
+                # ---- Stable-Baselines logger + W&B: mean reward ----
+                self_ = _locals.get('self', None)
+
+                # Log to SB/TF logger so it shows in TensorBoard
+                if self_ is not None and hasattr(self_, "logger"):
+                    self_.logger.record("eval/mean_reward_100ep", mean_reward)
+
+                # Also log explicitly to W&B (in addition to TB sync)
+                try:
+                    if wandb.run is not None:
+                        wandb.log(
+                            {"eval/mean_reward_100ep": mean_reward},
+                            step=current_step,
+                        )
+                except Exception:
+                    # Don't let W&B errors kill training
+                    pass
+
+                # ---- Normalized score logging (if baselines are available) ----
+                if (R_random is not None) and (R_expert is not None):
+                    denom = (R_expert - R_random)
+                    if denom != 0 and np.isfinite(denom):
+                        norm_score = (mean_reward - R_random) / denom
+                        if np.isfinite(norm_score):
+                            print("[Norm] mean_reward = {:.2f}, normalized_score = {:.3f}".format(
+                                mean_reward, norm_score
+                            ))
+
+                            # TB
+                            if self_ is not None and hasattr(self_, "logger"):
+                                self_.logger.record("eval/normalized_score", norm_score)
+
+                            # W&B
+                            try:
+                                if wandb.run is not None:
+                                    wandb.log({"eval/normalized_score": norm_score}, step=current_step)
+                            except Exception:
+                                pass
+                        else:
+                            print("[Norm] Skipping normalized_score (non-finite):", norm_score)
+                    else:
+                        print("[Norm] Skipping normalized_score (bad denom): R_expert-R_random =", denom)
+                else:
+                    if R_expert is None:
+                        print("[Norm] Not logging normalized_score: R_expert is None (expert returns not loaded).")
+
+                # ---- New best model: save with timestep + keep best_model.pkl ----
                 if mean_reward > best_mean_reward:
                     best_mean_reward = mean_reward
-                    # Example for saving best model
-                    print("Saving new best model")
-                    _locals['self'].save(os.path.join(log_dir, 'best_model.pkl'))
+
+                    if self_ is not None:
+                        # Keep old behavior for eval scripts:
+                        plain_path = os.path.join(log_dir, 'best_model.pkl')
+                        # Also save a non-overwriting checkpoint with timesteps in name:
+                        step_path = os.path.join(log_dir, 'best_model_{}steps.pkl'.format(current_step))
+
+                        print("Saving new best model:")
+                        print(" -", plain_path)
+                        print(" -", step_path)
+
+                        self_.save(plain_path)
+                        self_.save(step_path)
+
+                # Optional early stopping based on a target score
                 if 'train' in mode and mean_reward > max_score:
                     print("Stop training.")
                     return False
@@ -437,6 +501,32 @@ if __name__ == '__main__':
     parser.add_argument('--pref-rm', type=str, default=None)
     parser.add_argument('--pref-expect-obs-dim', type=int, default=17)
 
+        # --- Preference-reweighted teacher buffer (PR-SAIL) ---
+    parser.add_argument(
+        '--pref-reweight-teacher',
+        action='store_true',
+        help='Use offline pref reward model to reweight teacher trajectories for discriminator expert batches.'
+    )
+    parser.add_argument(
+        '--pref-beta',
+        type=float,
+        default=5.0,
+        help='Temperature for Boltzmann weighting over trajectory J_phi (softmax over trajectories).'
+    )
+    parser.add_argument(
+        '--pref-promote-quantile',
+        type=float,
+        default=0.5,
+        help='Quantile of current teacher J_phi used as threshold for promoting student trajectories.'
+    )
+    parser.add_argument(
+        '--pref-max-teacher-trajs',
+        type=int,
+        default=500,
+        help='Maximum number of trajectories in the teacher buffer (low-score ones are pruned).'
+    )
+
+
     parser.add_argument('--env', type=str, default="PongNoFrameskip-v4", help='environment ID')
     parser.add_argument('-tb', '--tensorboard-log', help='Tensorboard log dir', default='tb_logs', type=str)
     parser.add_argument('-i', '--trained-agent', help='Path to a pretrained agent to continue training',
@@ -526,7 +616,32 @@ type=int)
             args.verbose = 0
             args.tensorboard_log = ''
 
-    tensorboard_log = os.path.join(args.log_dir, 'tb')
+    # ------------- W&B + TensorBoard sync (rank 0 only) -------------
+    wandb_run = None
+    if rank == 0:
+        # Decide where TensorBoard logs go
+        # If user gives a relative tb dir (e.g., "tb_logs"), join with log_dir
+        if os.path.isabs(args.tensorboard_log):
+            tb_root = args.tensorboard_log
+        else:
+            tb_root = os.path.join(args.log_dir, args.tensorboard_log)
+
+        os.environ.setdefault("WANDB_SILENT", "true")
+
+        run_name = f"{args.task}_{args.algo}_{args.env}_seed{args.seed}"
+        wandb_run = wandb.init(
+            project="SAIL_variants",    # <- rename if you want
+            # name=run_name,
+            config=vars(args),
+            reinit=True
+        )
+
+        # This makes ALL TensorBoard scalars (reward, loss, normalized_score, etc.)
+        # automatically appear in W&B as the run's history.
+        wandb.tensorboard.patch(root_logdir=tb_root)
+    # ---------------------------------------------------------------
+
+    # tensorboard_log = os.path.join(args.log_dir, 'tb')
 
     is_atari = False
     if 'NoFrameskip' in env_id:
@@ -538,8 +653,15 @@ type=int)
     # Load hyperparameters & create environment
     #############################################
     hyperparams, saved_hyperparams = load_expert_hyperparams(args)
-    # ensure TB path comes from CLI
-    hyperparams['tensorboard_log'] = args.tensorboard_log
+
+    # Build a full TensorBoard root dir from log_dir + CLI tb subdir (or use absolute path)
+    if os.path.isabs(args.tensorboard_log):
+        tb_root = args.tensorboard_log
+    else:
+        tb_root = os.path.join(args.log_dir, args.tensorboard_log)
+
+    # Tell Stable-Baselines to log TensorBoard summaries here
+    hyperparams['tensorboard_log'] = tb_root
 
     # replace str in hyperparams to be real entities
     hyperparams = initiate_hyperparams(args, hyperparams)
@@ -558,14 +680,32 @@ type=int)
 
     # >>> Additive BPref->Disc settings (only used if --add-pref-to-disc is set)
     config['add_pref_to_disc'] = bool(args.add_pref_to_disc)
-    if config['add_pref_to_disc']:
-        # pass everything the algo needs; no critic changes required
+
+    # >>> New: preference-reweighted teacher buffer flag
+    config['pref_reweight_teacher'] = bool(getattr(args, 'pref_reweight_teacher', False))
+
+    # Common pref-RM config fields (used by add-pref-to-disc AND pref-reweight-teacher)
+    # We only expect SAIL code to actually *use* them when the corresponding flags are True.
+    if config['add_pref_to_disc'] or config['pref_reweight_teacher']:
         config['pref_rm_path'] = args.pref_rm
         config['pref_expect_obs_dim'] = args.pref_expect_obs_dim
-        config['pref_weight'] = args.pref_weight
         config['pref_norm'] = args.pref_norm          # 'zscore' | 'iqr-match' | 'none'
         config['pref_clip'] = args.pref_clip          # e.g., 5.0
-# <<< end additive settings
+
+    # Only additive BPref->Disc uses these:
+    if config['add_pref_to_disc']:
+        config['pref_weight'] = args.pref_weight
+
+    # Only pref-reweighted-teacher uses these:
+    if config['pref_reweight_teacher']:
+        config['pref_beta'] = args.pref_beta
+        config['pref_promote_quantile'] = args.pref_promote_quantile
+        config['pref_max_teacher_trajs'] = args.pref_max_teacher_trajs
+
+    # Push SAIL config into W&B config (rank 0 only)
+    if rank == 0 and wandb_run is not None:
+        wandb_run.config.update(config, allow_val_change=True)
+
     #args.log_dir = args.log_dir.replace('eval-bc', 'eval-bc-episode-{}'.format(config['n_episodes']))  
     os.makedirs(args.log_dir, exist_ok=True)
     env, hyperparams, normalize = create_env(args, hyperparams, n_timesteps)
@@ -614,6 +754,36 @@ type=int)
     data_save_dir = os.path.join("../../teacher_dataset", "expert_data_no_img_{}_scores_{}_episodes_{}".format(args.env.split('-')[0], config['optimal_score'], config['n_episodes']))
     data_save_dir = '{}.npz'.format(data_save_dir)
     print("Demo Data save in : {}".format(data_save_dir))
+
+        # === Normalization baselines ===
+    # Hardcode R_random for now (from your random-policy eval; adjust later if you want)
+    R_RANDOM = -270.0
+
+    # Load R_expert from the expert NPZ you are already using
+    R_expert = None
+    try:
+        exp_data = np.load(data_save_dir)
+        if "episode_returns" in exp_data:
+            R_expert = float(exp_data["episode_returns"].mean())
+            print("[Norm] Loaded expert returns from {} -> R_expert = {:.2f}".format(
+                data_save_dir, R_expert
+            ))
+        else:
+            print("[Norm] WARNING: 'episode_returns' not found in {}; normalized logging will be disabled.".format(
+                data_save_dir
+            ))
+    except FileNotFoundError:
+        print("[Norm] WARNING: expert file {} not found; normalized logging will be disabled.".format(
+            data_save_dir
+        ))
+
+    # ---- Change 2: W&B debug / summary fields (rank 0 only) ----
+    if rank == 0 and wandb_run is not None:
+        wandb_run.summary["R_random"] = float(R_RANDOM)
+        wandb_run.summary["R_expert_loaded"] = (R_expert is not None)
+        if R_expert is not None:
+            wandb_run.summary["R_expert"] = float(R_expert)
+            wandb_run.summary["R_expert_minus_R_random"] = float(R_expert - R_RANDOM)
 
     #####################################
     # build model
@@ -694,7 +864,15 @@ type=int)
         print(config)
         time.sleep(3)
         config['log_dir'] = args.log_dir
-        cb_func = a2c_callback(args.log_dir, config['max_score'], args.task)
+        # cb_func = a2c_callback(args.log_dir, config['max_score'], args.task)
+        # Pass normalization baselines into the callback
+        cb_func = a2c_callback(
+            args.log_dir,
+            config['max_score'],
+            args.task,
+            R_random=R_RANDOM,
+            R_expert=R_expert,
+        )
         model.learn(
             n_timesteps,
             callback=cb_func,
@@ -704,7 +882,20 @@ type=int)
         with open(os.path.join(args.log_dir, 'config.yml'), 'w') as f:
             yaml.dump(saved_hyperparams, f)
 
+        # ------------- Close W&B run (rank 0 only) -------------
+    if rank == 0 and wandb_run is not None:
+        # Save some nice run-level info
+        try:
+            wandb_run.summary["R_random"] = R_RANDOM
+            if R_expert is not None:
+                wandb_run.summary["R_expert"] = R_expert
+            wandb_run.summary["best_mean_reward"] = best_mean_reward
+        except NameError:
+            # In case some of these are not defined in certain tasks
+            pass
 
+        wandb_run.finish()
+    # -------------------------------------------------------
 
 
 

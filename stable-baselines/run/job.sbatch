@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=8G
 #SBATCH --time=24:00:00
-#SBATCH --array=0-2                          # 3 variants = 3 tasks
+#SBATCH --array=0-1                          # 3 variants = 3 tasks
 #SBATCH --output=/nfs/turbo/umd-sabymath/Soham/sail-tf1b/stable-baselines/run/logs/slurm_%A_%a.out
 #SBATCH --error=/nfs/turbo/umd-sabymath/Soham/sail-tf1b/stable-baselines/run/logs/slurm_%A_%a.err
 #SBATCH --account=sabymath0
@@ -27,17 +27,19 @@ TEACHER_SRC=${REPO_ROOT}/teacher_dataset
 
 # Choose the teacher dataset file you want this run to use:
 # (example: your 3000-episode legacy-exact file)
-FORCE_DATASET="${REPO_ROOT}/stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_3000_episodes_4_legacy_exact.npz"
-EPISODES=4   # must match the suffix in the filename SAIL builds
+FORCE_DATASET="${REPO_ROOT}/stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_300_episodes_8_legacy_exact.npz"
+EPISODES=8   # must match the suffix in the filename SAIL builds
 # ----------------------------------------------------------------------
 
 # (Only used for non-vanilla variants)
 PREF_RM=/nfs/turbo/umd-sridas/Soham/BPref/runs/halfcheetah/pebble_oracle_b500_seg50_disa_s0/exports/reward_model_ts.pt
 
 ENV_ID=HalfCheetah-v2
-STEPS=1000000       # quick run; increase for full training
-SEEDS=(0)
-VARIANTS=(vanilla critic adddisc)
+STEPS=1000000      # quick run; increase for full training
+SEEDS=(10 11)
+# VARIANTS=(vanilla critic adddisc)
+# VARIANTS=(adddisc)
+VARIANTS=(vanilla)
 
 VID=$(( SLURM_ARRAY_TASK_ID % ${#VARIANTS[@]} ))
 SID=$(( SLURM_ARRAY_TASK_ID / ${#VARIANTS[@]} ))
@@ -62,9 +64,13 @@ export TF_CPP_MIN_LOG_LEVEL=2
 source "${VENV}/bin/activate"
 mkdir -p "${RUN_DIR}/logs" "${RUN_DIR}/tb_logs"
 
-# Make hyperparams visible as ../hyperparams/sail.yml
+# Make sure we are using the dedicated SAIL hyperparams (not TD3)
 cd "${RUN_DIR}"
-test -f ../hyperparams/sail.yml || ln -sf td3.yml ../hyperparams/sail.yml
+if [[ ! -f ../hyperparams/sail.yml ]]; then
+  echo "[ERROR] ../hyperparams/sail.yml is missing. Please restore it (git pull) before running."
+  exit 1
+fi
+echo "[INFO] Using hyperparams file: $(readlink -f ../hyperparams/sail.yml)"
 
 # Ensure ../teacher_dataset exists and points to your chosen teacher dir
 cd "${REPO_ROOT}"
@@ -93,23 +99,31 @@ COMMON_ARGS=(
 
 case "${VAR}" in
   vanilla)
-    RUN_NAME="vanilla_hc_v2_${STEPS}_s${SEED}"
+    RUN_NAME="vanillaSAIL300ep_${STEPS}_s${SEED}"
     EXTRA_ARGS=()
     ;;
 
   critic)
-    RUN_NAME="bpref_critic_hc_v2_${STEPS}_s${SEED}"
+    RUN_NAME="bpref_criticC_50_hc_v2_${STEPS}_s${SEED}"
     EXTRA_ARGS=( --use-pref-critic --pref-rm "${PREF_RM}" --pref-expect-obs-dim 17 --lambda-ref 0.10 )
     ;;
 
   adddisc)
-    RUN_NAME="bpref_disc_hc_v2_${STEPS}_s${SEED}"
+    RUN_NAME="discsail1500_${STEPS}_s${SEED}"
     EXTRA_ARGS=( --add-pref-to-disc --pref-rm "${PREF_RM}" --pref-expect-obs-dim 17 --pref-weight 1.0 --pref-norm zscore --pref-clip 5.0 )
     ;;
 
   *)
     echo "Unknown variant ${VAR}" >&2; exit 2;;
 esac
+
+# ---- W&B naming from sbatch (Option B) ----
+export WANDB_PROJECT="SAIL_variants"
+export WANDB_NAME="${RUN_NAME}"
+# export WANDB_GROUP="${ENV_ID}_${VAR}_${STEPS}"
+# Optional: your account/entity (only if needed)
+# export WANDB_ENTITY="sohams1-university-of-michigan"
+# ------------------------------------------
 
 # Safety check for pref model when required
 if [[ "${VAR}" != "vanilla" ]] && [[ ! -f "${PREF_RM}" ]]; then
@@ -122,7 +136,7 @@ PYTHONPATH="$PWD/.." python -u train_sail.py \
   "${COMMON_ARGS[@]}" \
   "${EXTRA_ARGS[@]}" \
   --tensorboard-log "tb_logs/${RUN_NAME}" \
-  --log-folder      "logs/${RUN_NAME}"
+  --log-dir      "logs/${RUN_NAME}"
 set +x
 
 echo "Done: ${RUN_NAME}"

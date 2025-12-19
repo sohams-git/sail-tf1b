@@ -536,6 +536,10 @@ class DiscriminatorCalssifier(object):
                                             name="gail_expert_observations_ph")
         self.expert_acs_ph = tf.placeholder(action_space.dtype, (None,) + self.actions_shape,
                                             name="gail_expert_actions_ph")
+        
+        self.expert_w_ph = tf.placeholder(tf.float32, (None, 1),
+                                          name="gail_expert_weights_ph")
+
         # Build graph
         generator_input = self.flatten(self.generator_obs_ph, self.generator_acs_ph, reuse=False)
         generator_input = tf.stop_gradient(generator_input)
@@ -550,11 +554,33 @@ class DiscriminatorCalssifier(object):
         # Build regression loss
         # let x = logits, z = targets.
         # z * -log(sigmoid(x)) + (1 - z) * -log(1 - sigmoid(x))
-        sample_generator_loss = tf.nn.sigmoid_cross_entropy_with_logits(logits=generator_logits,
-                                                                 labels=tf.zeros_like(generator_logits))
+
+        # sample_generator_loss = tf.nn.sigmoid_cross_entropy_with_logits(logits=generator_logits,
+        #                                                          labels=tf.zeros_like(generator_logits))
+        # generator_loss = tf.reduce_mean(sample_generator_loss)
+        # sample_expert_loss = tf.nn.sigmoid_cross_entropy_with_logits(logits=expert_logits, labels=tf.ones_like(expert_logits))
+        # expert_loss = tf.reduce_mean(sample_expert_loss)
+
+        # Per-sample losses
+        sample_generator_loss = tf.nn.sigmoid_cross_entropy_with_logits(
+            logits=generator_logits,
+            labels=tf.zeros_like(generator_logits)
+        )
         generator_loss = tf.reduce_mean(sample_generator_loss)
-        sample_expert_loss = tf.nn.sigmoid_cross_entropy_with_logits(logits=expert_logits, labels=tf.ones_like(expert_logits))
-        expert_loss = tf.reduce_mean(sample_expert_loss)
+
+        sample_expert_loss = tf.nn.sigmoid_cross_entropy_with_logits(
+            logits=expert_logits,
+            labels=tf.ones_like(expert_logits)
+        )
+
+        # Ensure shapes are [N, 1]
+        sample_expert_loss = tf.reshape(sample_expert_loss, (-1, 1))
+        weights = self.expert_w_ph  # [N, 1]
+
+        # Weighted expert loss: sum(w_i * loss_i) / sum(w_i)
+        weighted_expert_loss = sample_expert_loss * weights
+        expert_loss = tf.reduce_sum(weighted_expert_loss) / (tf.reduce_sum(weights) + 1e-8)
+
         # Build entropy loss
         logits = tf.concat([generator_logits, expert_logits], 0)
         entropy = tf.reduce_mean(logit_bernoulli_entropy(logits))
@@ -576,13 +602,45 @@ class DiscriminatorCalssifier(object):
         self.losses = [generator_loss, expert_loss, entropy, entropy_loss, generator_acc, expert_acc, grad_penalty]
         self.loss_name = ["generator_loss", "expert_loss", "entropy", "entropy_loss", "generator_acc", "expert_acc", "grad_penalty_loss"]
         self.total_loss = generator_loss + expert_loss + entropy_loss + grad_penalty
+
+        #  # ----- L2 weight decay over discriminator parameters -----
+        # disc_vars = self.get_trainable_variables()
+        # # Optional: skip biases if you want
+        # l2_term = tf.add_n([tf.nn.l2_loss(v) for v in disc_vars if 'bias' not in v.name])
+        # weight_decay = getattr(self, "weight_decay", 1e-3)  # default if not set
+        # l2_loss = weight_decay * l2_term
+
+        # # Loss + Accuracy terms
+        # self.losses = [
+        #     generator_loss,
+        #     expert_loss,
+        #     entropy,
+        #     entropy_loss,
+        #     generator_acc,
+        #     expert_acc,
+        #     grad_penalty,
+        #     l2_loss,
+        # ]
+        # self.loss_name = [
+        #     "generator_loss",
+        #     "expert_loss",
+        #     "entropy",
+        #     "entropy_loss",
+        #     "generator_acc",
+        #     "expert_acc",
+        #     "grad_penalty_loss",
+        #     "l2_reg_loss",
+        # ]
+
+        # self.total_loss = generator_loss + expert_loss + entropy_loss + grad_penalty + l2_loss
+
         self.sample_loss = [sample_expert_loss, sample_generator_loss]
         # Build Reward for policy
         self.reward_op = -tf.log(1 - tf.nn.sigmoid(generator_logits) + 1e-8)
         self.confidence_op = tf.nn.sigmoid(generator_logits) 
         var_list = self.get_trainable_variables()
         self.lossandgrad = tf_util.function(
-            [self.generator_obs_ph, self.generator_acs_ph, self.expert_obs_ph, self.expert_acs_ph],
+            [self.generator_obs_ph, self.generator_acs_ph, self.expert_obs_ph, self.expert_acs_ph, self.expert_w_ph,],
             self.losses + [tf_util.flatgrad(self.total_loss, var_list)])
 
     def flatten(self, obs_ph, acs_ph, reuse=False):

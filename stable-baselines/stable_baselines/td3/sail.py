@@ -158,7 +158,15 @@ class SAIL(OffPolicyRLModel):
         self.absorbing_per_episode=absorbing_per_episode
         self.q_regularize = q_regularize
 
+        # Preference-based teacher reweighting (PR-SAIL)
+        self.pref_teacher_episodes = None   # list of dicts: {'obs': [T+1, d_o], 'acs': [T, d_a], 'J': float}
+        self.pref_teacher_scores = None     # np.array [N_traj]
+        self.pref_teacher_weights = None    # np.array [N_traj], softmax over scores
+        self._pref_teacher_rm = None        # offline BPref reward model for teacher reweighting
+
+
         self.d_batch_size = self.batch_size
+        # self.d_batch_size = 5000
         if self.using_gail or self.lfd:
             self.expert_dataset = ExpertDataset(expert_path=self.expert_data_path, ob_flatten=False)
             print('-'*20 + "expert_data_path: {}".format(self.expert_data_path))
@@ -430,21 +438,166 @@ class SAIL(OffPolicyRLModel):
                 ac_expert = np.clip(ac_expert + noises, -1, 1)
         return ac_expert
 
-    def generate_discriminator_data(self, mode = None):
-        expert_batch = self.demo_replay_buffer.sample(self.d_batch_size )
-        ob_expert, ac_expert = expert_batch[:2]
-        # disturb expert actions if needed
-        #ac_expert = self.shift_actions(ac_expert)
+    # ======================================================================
+    # Preference-weighted teacher buffer (PR-SAIL) helpers
+    # ======================================================================
+    def _ensure_pref_teacher_rm(self):
+        """
+        Lazy-load the offline preference reward model used ONLY for
+        teacher reweighting (PR-SAIL).
+        """
+        if self._pref_teacher_rm is not None:
+            return self._pref_teacher_rm
+
+        cfg = getattr(self, "config", None)
+        if cfg is None:
+            print("[SAIL:pref-reweight] WARNING: config is None; cannot load pref RM.")
+            return None
+
+        if not cfg.get('pref_reweight_teacher', False):
+            return None
+
+        path = cfg.get('pref_rm_path', None)
+        if not path:
+            print("[SAIL:pref-reweight] WARNING: pref_rm_path missing; disabling pref_reweight_teacher.")
+            cfg['pref_reweight_teacher'] = False
+            return None
+
+        try:
+            from stable_baselines.common.pref_rm_eval import PrefRewardModel
+            expect = int(cfg.get('pref_expect_obs_dim', 17))
+            self._pref_teacher_rm = PrefRewardModel(path, expect_obs_dim=expect)
+            print("[SAIL:pref-reweight] Loaded pref RM for teacher reweighting:",
+                  path, "beta=", cfg.get('pref_beta', 1.0))
+        except Exception as e:
+            print("[SAIL:pref-reweight] ERROR loading pref RM:", e)
+            cfg['pref_reweight_teacher'] = False
+            self._pref_teacher_rm = None
+
+        return self._pref_teacher_rm
+
+    def _recompute_pref_teacher_weights(self):
+        """
+        Recompute J_phi(τ) and softmax weights w(τ) for all teacher episodes.
+        """
+        if not self.pref_teacher_episodes:
+            self.pref_teacher_scores = None
+            self.pref_teacher_weights = None
+            return
+
+        scores = np.array([ep['J'] for ep in self.pref_teacher_episodes], dtype=np.float64)
+        beta = float(self.config.get('pref_beta', 1.0))
+        s = scores / beta
+        s = s - s.max()
+        w = np.exp(s)
+        w = w / (w.sum() + 1e-8)
+
+        self.pref_teacher_scores = scores
+        self.pref_teacher_weights = w
+
+    def _build_pref_teacher_buffer(self, demo_obs, demo_actions, demo_dones, demo_episode_scores):
+        """
+        Build initial preference-weighted teacher episodes from demo data.
+
+        We group transitions into episodes using demo_dones, compute
+        J_phi(τ) = sum_t R_phi(s_t, a_t) for each episode, then
+        compute Boltzmann weights over episodes.
+        """
+        if not self.config.get('pref_reweight_teacher', False):
+            return
+
+        rm = self._ensure_pref_teacher_rm()
+        if rm is None:
+            return
+
+        done_idx = np.where(demo_dones == 1)[0]
+        if done_idx.size == 0:
+            print("[SAIL:pref-reweight] WARNING: no episode boundaries found in demos.")
+            return
+
+        episodes = []
+        scores = []
+
+        start = 0
+        for ep_i, last in enumerate(done_idx):
+            # indices [start, last] inclusive
+            obs_ep = demo_obs[start:last + 1]      # [L+1, obs_dim]
+            acs_ep = demo_actions[start:last + 1]  # [L+1, act_dim] (final action may be unused by env, ok)
+
+            try:
+                r_pref = rm.reward(obs_ep, acs_ep)
+                r_pref = np.asarray(r_pref).reshape(-1)
+                J = float(r_pref.sum())
+            except Exception as e:
+                print("[SAIL:pref-reweight] ERROR computing J_phi for demo episode", ep_i, ":", e)
+                J = 0.0
+
+            episodes.append({'obs': obs_ep.copy(), 'acs': acs_ep.copy(), 'J': J})
+            scores.append(J)
+            start = last + 1
+
+        self.pref_teacher_episodes = episodes
+        self.pref_teacher_scores = np.asarray(scores, dtype=np.float64)
+        self._recompute_pref_teacher_weights()
+        print("[SAIL:pref-reweight] Built initial teacher buffer with",
+              len(self.pref_teacher_episodes), "episodes.")
+
+    def _sample_pref_weighted_expert(self):
+        """
+        Sample a batch of (obs, act, w) expert triples using preference weights
+        over episodes. Fallback to uniform demo_replay_buffer if needed.
+        """
+        B = self.d_batch_size
+
+        # Fallback: no pref-reweight → vanilla GAIL with all-ones weights
+        if (not self.config.get('pref_reweight_teacher', False)
+                or self.pref_teacher_episodes is None
+                or self.pref_teacher_weights is None
+                or len(self.pref_teacher_episodes) == 0):
+            expert_batch = self.demo_replay_buffer.sample(B)
+            ob_expert, ac_expert = expert_batch[:2]
+            # weights = 1.0 → unweighted GAIL
+            expert_w = np.ones((ob_expert.shape[0], 1), dtype=np.float32)
+            return ob_expert, ac_expert, expert_w
+
+        episodes = self.pref_teacher_episodes
+        weights = self.pref_teacher_weights  # shape [N_eps]
+        n_eps = len(episodes)
+
+        obs_list, ac_list, w_list = [], [], []
+        for _ in range(B):
+            ep_idx = np.random.randint(0, n_eps)   # <-- instead of np.random.choice(..., p=weights)
+            ep = episodes[ep_idx]
+            T = ep['acs'].shape[0]
+            t = np.random.randint(0, T)
+
+            obs_list.append(ep['obs'][t])
+            ac_list.append(ep['acs'][t])
+            # per-sample weight is the trajectory's softmax weight
+            w_list.append(weights[ep_idx])
+
+        ob_expert = np.asarray(obs_list)
+        ac_expert = np.asarray(ac_list)
+        expert_w = np.asarray(w_list, dtype=np.float32).reshape(-1, 1)
+        return ob_expert, ac_expert, expert_w
+
+
+    def generate_discriminator_data(self, mode=None):
+        # Sample expert transitions + per-sample weights
+        ob_expert, ac_expert, expert_w = self._sample_pref_weighted_expert()
 
         if 'online' in mode:
             batch = self.cache_buffer.sample(self.d_batch_size)
         else:
             batch = self.replay_buffer.sample(self.d_batch_size)
-        ob_batch, ac_batch =  batch[:2]
+        ob_batch, ac_batch = batch[:2]
 
         # update running mean/std for discriminator
         if self.discriminator.normalize:
-            self.discriminator.obs_rms.update(np.concatenate((ob_batch, ob_expert), 0),sess=self.sess)
+            self.discriminator.obs_rms.update(
+                np.concatenate((ob_batch, ob_expert), 0),
+                sess=self.sess
+            )
 
         # Reshape actions if needed when using discrete actions
         if isinstance(self.action_space, gym.spaces.Discrete):
@@ -453,7 +606,8 @@ class SAIL(OffPolicyRLModel):
             if len(ac_expert.shape) == 2:
                 ac_expert = ac_expert[:, 0]
 
-        return ob_expert, ac_expert, ob_batch, ac_batch
+        # IMPORTANT: now return expert_w too
+        return ob_expert, ac_expert, ob_batch, ac_batch, expert_w
 
 
     def _train_discriminator(self, writer, logger, step, current_d_lr, shaping_mode):
@@ -465,13 +619,14 @@ class SAIL(OffPolicyRLModel):
         # NOTE: uses only the last g step for observation
         d_losses = []  # list of tuples, each of which gives the loss for a minibatch
         for i in range(self.d_gradient_steps):
-            ob_expert, ac_expert, ob_batch, ac_batch = self.generate_discriminator_data(shaping_mode)
+            ob_expert, ac_expert, ob_batch, ac_batch, expert_w = self.generate_discriminator_data(shaping_mode)
 
             feed_dict = {
                 self.discriminator.generator_obs_ph: ob_batch,
                 self.discriminator.generator_acs_ph: ac_batch,
                 self.discriminator.expert_obs_ph: ob_expert,
                 self.discriminator.expert_acs_ph: ac_expert,
+                self.discriminator.expert_w_ph: expert_w,   # NEW
                 self.d_learning_rate_ph: current_d_lr
             }
 
@@ -530,6 +685,20 @@ class SAIL(OffPolicyRLModel):
             if self.norm_sparse_reward:
                 true_reward = self.normalize_score(episode_score)
         self.demo_replay_buffer.add(demo_obs[-1], demo_actions[-1], demo_rewards[-1], demo_obs[-1], float(demo_dones[-1]), 1.0, es, true_reward)
+
+        # ------------------------------------------------------------------
+        # Build initial preference-weighted teacher episodes (PR-SAIL)
+        # ------------------------------------------------------------------
+        try:
+            self._build_pref_teacher_buffer(
+                demo_obs=demo_obs,
+                demo_actions=demo_actions,
+                demo_dones=demo_dones,
+                demo_episode_scores=demo_episode_scores
+            )
+        except Exception as e:
+            print("[SAIL:pref-reweight] ERROR building initial teacher buffer:", e)
+
 
     def eval(self, env, deterministic=True, episodes=1, render=False, callback=None):
         episode_rewards, n_steps = [], 0
@@ -679,21 +848,75 @@ class SAIL(OffPolicyRLModel):
 
                     if self.adaptive:
                         if episode_score > self.expert_scores[0]:
-                            print("Adding new trajectory with score {} to replay buffer, expert-score {} ".format(episode_score,self.expert_scores[0]))
+                            print("Adding new trajectory with score {} to replay buffer, expert-score {} ".format(episode_score, self.expert_scores[0]))
+
+                            # -------------------------
+                            # 1) Add to demo_replay_buffer (original SAIL behavior)
+                            # -------------------------
+                            obs_ep = []
+                            acs_ep = []
+                            
                             for transition in self.episode_buffer.get_episode_return(es):
-                                s, a, r, s1, if_done, _, _, true_r, discount_return  = transition
+                                s, a, r, s1, if_done, _, _, true_r, discount_return = transition
                                 self.demo_replay_buffer.add(s, a, r, s1, if_done, 1.0, discount_return, true_r)
 
+                                obs_ep.append(s)
+                                acs_ep.append(a)
+                                
+
+
+                            obs_ep = np.asarray(obs_ep)
+                            acs_ep = np.asarray(acs_ep)
+
+                            # Maintain top-10 expert_scores list (unchanged behavior)
                             if len(self.expert_scores) >= 10:
                                 self.expert_scores.pop(0)
                             self.expert_scores.append(episode_score)
                             self.expert_scores.sort()
-                            self.mix = False # once we reach threshold, we should stop using expert data
-                    # reset episode buffer
-                    self.episode_buffer.reset()
+                            self.mix = False  # once we reach threshold, we should stop using expert data
+
+                            # -------------------------
+                            # 2) ALSO add to pref teacher episode buffer (PR-SAIL only)
+                            # -------------------------
+                            if self.config.get('pref_reweight_teacher', False):
+                                rm = self._ensure_pref_teacher_rm()
+                                if rm is not None:
+                                    try:
+                                        r_pref = rm.reward(obs_ep, acs_ep)
+                                        r_pref = np.asarray(r_pref).reshape(-1)
+                                        J = float(r_pref.sum())
+                                    except Exception as e:
+                                        print("[SAIL:pref-reweight] ERROR computing J_phi for student episode:", e)
+                                        J = 0.0
+
+                                    if self.pref_teacher_episodes is None:
+                                        self.pref_teacher_episodes = []
+
+                                    self.pref_teacher_episodes.append({
+                                        'obs': obs_ep.copy(),
+                                        'acs': acs_ep.copy(),
+                                        'J': J
+                                    })
+
+                                    # Prune if too many trajectories: drop low-J_phi episodes
+                                    max_traj = int(self.config.get('pref_max_teacher_trajs', 500))
+                                    if len(self.pref_teacher_episodes) > max_traj:
+                                        scores = np.array([ep['J'] for ep in self.pref_teacher_episodes], dtype=np.float64)
+                                        q = float(self.config.get('pref_promote_quantile', 0.75))
+                                        thresh = np.quantile(scores, q)
+                                        keep_idx = [i for i, ep in enumerate(self.pref_teacher_episodes) if ep['J'] >= thresh]
+                                        if len(keep_idx) == 0:
+                                            # ensure we keep at least the best one
+                                            best = int(np.argmax(scores))
+                                            keep_idx = [best]
+                                        self.pref_teacher_episodes = [self.pref_teacher_episodes[i] for i in keep_idx]
+
+                                    # Recompute softmax weights over all teacher episodes
+                                    self._recompute_pref_teacher_weights()
+
                     ## record most 10 expert episodic scores in to log file
                     #avg_expert_score = np.mean(self.expert_scores)
-
+                    self.episode_buffer.reset()
                 obs = new_obs
 
                 if writer is not None:

@@ -157,3 +157,16 @@ venv/
 # Slurm job logs
 slurm_*.out
 slurm_*.err
+
+# --- experiment outputs ---
+stable-baselines/run/wandb/
+stable-baselines/run/eval_logs/
+stable-baselines/run/logs_smoke/
+stable-baselines/run/*.out
+stable-baselines/run/*.err
+
+# --- datasets / large binaries ---
+teacher_dataset/*.npz
+
+# --- misc ---
+*.tfevents.*
