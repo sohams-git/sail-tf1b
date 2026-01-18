@@ -173,8 +173,13 @@ class SAIL(OffPolicyRLModel):
             time.sleep(4)
             n_samples = len(self.expert_dataset.observations)
 
+        # config is set in learn(), but setup_model() may run in __init__
+        # so keep a safe default here
+        self.config = None
+
         if _init_setup_model:
-            self.setup_model()
+            # self.setup_model()
+            pass
 
 
     def _get_pretrain_placeholders(self):
@@ -198,14 +203,20 @@ class SAIL(OffPolicyRLModel):
 
                 # initialize GAIL discriminator
                 if self.using_gail:
+                    cfg = self.config or {}  # IMPORTANT: setup_model may run before learn sets config
+
                     self.discriminator = DiscriminatorCalssifier(
                         self.observation_space,
                         self.action_space,
-                        #self.hidden_size_adversary,
-                        #entcoeff=self.adversary_entcoeff,
                         256,
                         0.01,
-                        gradcoeff=10)
+                        gradcoeff=10,
+
+                        # ----- NEW FLAGS -----
+                        dualhead=cfg.get('disc_dualhead', False),
+                        aux_weight=cfg.get('disc_aux_weight', 0.0),
+                        use_expert_weights=cfg.get('disc_use_expert_weights', False),
+                    )
 
                 self.bc = VAE(
                     self.observation_space,
@@ -409,7 +420,6 @@ class SAIL(OffPolicyRLModel):
             self.learning_rate_ph: learning_rate
         }
 
-
         step_ops = self.step_ops
         if update_policy:
             # Update policy and target networks
@@ -454,7 +464,7 @@ class SAIL(OffPolicyRLModel):
             print("[SAIL:pref-reweight] WARNING: config is None; cannot load pref RM.")
             return None
 
-        if not cfg.get('pref_reweight_teacher', False):
+        if not (cfg.get('pref_reweight_teacher', False) or cfg.get('pref_rank_disc', False)):
             return None
 
         path = cfg.get('pref_rm_path', None)
@@ -503,7 +513,7 @@ class SAIL(OffPolicyRLModel):
         J_phi(τ) = sum_t R_phi(s_t, a_t) for each episode, then
         compute Boltzmann weights over episodes.
         """
-        if not self.config.get('pref_reweight_teacher', False):
+        if not (self.config.get('pref_reweight_teacher', False) or self.config.get('pref_rank_disc', False)):
             return
 
         rm = self._ensure_pref_teacher_rm()
@@ -581,6 +591,79 @@ class SAIL(OffPolicyRLModel):
         expert_w = np.asarray(w_list, dtype=np.float32).reshape(-1, 1)
         return ob_expert, ac_expert, expert_w
 
+    def _sample_full_episode_pref_pairs(self, B):
+    # """ Sample B preference-labeled pairs (tau+, tau-) from pref_teacher_episodes,
+    # using stored J as the preference signal.
+
+    # Returns padded arrays:
+    #   pos_obs:  [B, Lmax, obs_dim]
+    #   pos_acs:  [B, Lmax, act_dim]
+    #   pos_mask: [B, Lmax, 1]   (1 for valid steps)
+    #   neg_obs:  [B, Lmax, obs_dim]
+    #   neg_acs:  [B, Lmax, act_dim]
+    #   neg_mask: [B, Lmax, 1]
+    # """
+        if(self.pref_teacher_episodes is None) or (len(self.pref_teacher_episodes) < 2):
+            return None
+
+        eps = self.pref_teacher_episodes
+        N = len(eps)
+
+        # --- sample indices for pairs ---
+        idx_a = np.random.randint(0, N, size=B)
+        idx_b = np.random.randint(0, N, size=B)
+
+        # ensure a != b (simple resample loop)
+        for k in range(B):
+            if idx_b[k] == idx_a[k]:
+                idx_b[k] = (idx_b[k] + 1) % N
+
+        # --- decide which is preferred via stored J ---
+        pos_eps = []
+        neg_eps = []
+        for a, b in zip(idx_a, idx_b):
+            Ja = float(eps[a].get('J', 0.0))
+            Jb = float(eps[b].get('J', 0.0))
+            if Ja >= Jb:
+                pos_eps.append(eps[a])
+                neg_eps.append(eps[b])
+            else:
+                pos_eps.append(eps[b])
+                neg_eps.append(eps[a])
+
+        # --- pad to Lmax within this batch ---
+        def _len(ep):
+            return int(ep['acs'].shape[0])
+
+        Lmax = max(max(_len(ep) for ep in pos_eps), max(_len(ep) for ep in neg_eps))
+
+        obs_dim = pos_eps[0]['obs'].shape[1]
+        act_dim = pos_eps[0]['acs'].shape[1]
+
+        pos_obs  = np.zeros((B, Lmax, obs_dim), dtype=np.float32)
+        pos_acs  = np.zeros((B, Lmax, act_dim), dtype=np.float32)
+        pos_mask = np.zeros((B, Lmax), dtype=np.float32)
+
+        neg_obs  = np.zeros((B, Lmax, obs_dim), dtype=np.float32)
+        neg_acs  = np.zeros((B, Lmax, act_dim), dtype=np.float32)
+        neg_mask = np.zeros((B, Lmax), dtype=np.float32)
+
+        for i in range(B):
+            epP = pos_eps[i]
+            epN = neg_eps[i]
+
+            LP = _len(epP)
+            LN = _len(epN)
+
+            pos_obs[i, :LP] = epP['obs'][:LP]
+            pos_acs[i, :LP] = epP['acs'][:LP]
+            pos_mask[i, :LP] = 1.0
+
+            neg_obs[i, :LN] = epN['obs'][:LN]
+            neg_acs[i, :LN] = epN['acs'][:LN]
+            neg_mask[i, :LN] = 1.0
+
+        return pos_obs, pos_acs, pos_mask, neg_obs, neg_acs, neg_mask
 
     def generate_discriminator_data(self, mode=None):
         # Sample expert transitions + per-sample weights
@@ -630,6 +713,41 @@ class SAIL(OffPolicyRLModel):
                 self.d_learning_rate_ph: current_d_lr
             }
 
+            # ------------------- preference ranking regularizer (full episodes) -------------------
+            if self.config.get('pref_rank_disc', False):
+                w_pref = float(self.config.get('pref_rank_weight', 0.0))
+                Bp = int(self.config.get('pref_rank_batch_size', 32))
+
+                # Only run if weight > 0 and we have teacher episodes with J
+                if (w_pref > 0.0) and (self.pref_teacher_episodes is not None) and (len(self.pref_teacher_episodes) >= 2):
+                    pair = self._sample_full_episode_pref_pairs(Bp)
+                    if pair is not None:
+                        pos_obs, pos_acs, pos_mask, neg_obs, neg_acs, neg_mask = pair
+
+                        
+
+                        feed_dict.update({
+                            self.discriminator.pref_pos_obs_ph: pos_obs,
+                            self.discriminator.pref_pos_acs_ph: pos_acs,
+                            self.discriminator.pref_pos_mask_ph: pos_mask,
+                            self.discriminator.pref_neg_obs_ph: neg_obs,
+                            self.discriminator.pref_neg_acs_ph: neg_acs,
+                            self.discriminator.pref_neg_mask_ph: neg_mask,
+                            self.discriminator.pref_loss_weight: w_pref,
+                        })
+                    else:
+                        # no valid pair batch -> disable this iter
+                        feed_dict.update({self.discriminator.pref_loss_weight: 0.0})
+                else:
+                    feed_dict.update({self.discriminator.pref_loss_weight: 0.0})
+            else:
+                feed_dict.update({self.discriminator.pref_loss_weight: 0.0})
+        # -------------------------------------------------------------------------------------
+
+            if (i == 0) and (step % 5000 == 0):  # occasional debug
+                active = float(feed_dict.get(self.discriminator.pref_loss_weight, 0.0))
+                n_eps = 0 if self.pref_teacher_episodes is None else len(self.pref_teacher_episodes)
+                print(f"[pref-rank] step={step} active_w={active} n_teacher_eps={n_eps}")
             if writer is not None:
                 run_ops = [self.gail_summary] + self.gail_sample_loss + self.gail_item_loss + [self.gail_total_loss, self.gail_train_op]
                 out = self.sess.run(run_ops, feed_dict)
@@ -735,6 +853,10 @@ class SAIL(OffPolicyRLModel):
 
         new_tb_log = self._init_num_timesteps(reset_num_timesteps)
         self.config = config
+        # --- CHANGE 3: build TF graph AFTER config is known ---
+        if (self.graph is None) or (self.sess is None) or (self.discriminator is None and self.using_gail):
+            self.setup_model()
+
         log_dir = config['log_dir']
         shaping_mode = self.config['shaping_mode']
         # first, add expert-demonstrations in the replay buffer
@@ -878,7 +1000,7 @@ class SAIL(OffPolicyRLModel):
                             # -------------------------
                             # 2) ALSO add to pref teacher episode buffer (PR-SAIL only)
                             # -------------------------
-                            if self.config.get('pref_reweight_teacher', False):
+                            if self.config.get('pref_reweight_teacher', False) or self.config.get('pref_rank_disc', False):
                                 rm = self._ensure_pref_teacher_rm()
                                 if rm is not None:
                                     try:

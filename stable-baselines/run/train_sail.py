@@ -525,6 +525,24 @@ if __name__ == '__main__':
         default=500,
         help='Maximum number of trajectories in the teacher buffer (low-score ones are pruned).'
     )
+    # --- NEW: Preference ranking regularizer on discriminator (full episodes) ---
+    parser.add_argument(
+        '--pref-rank-disc',
+        action='store_true',
+        help='Enable preference-ranking regularizer on discriminator using full episodes.'
+    )
+    parser.add_argument(
+        '--pref-rank-weight',
+        type=float,
+        default=0.0,
+        help='Weight for preference-ranking loss on discriminator (0 disables).'
+    )
+    parser.add_argument(
+        '--pref-rank-batch-size',
+        type=int,
+        default=32,
+        help='Number of preference pairs per discriminator update (Bp).'
+    )
 
 
     parser.add_argument('--env', type=str, default="PongNoFrameskip-v4", help='environment ID')
@@ -559,6 +577,14 @@ type=int)
         type=str,
         default='train',
         help='Figure it out yourself.╭(╯^╰)╮')
+    
+    parser.add_argument('--disc-dualhead', action='store_true',
+                    help='Use dual-head discriminator (main + aux head).')
+    parser.add_argument('--disc-aux-weight', type=float, default=0.0,
+                    help='Weight for aux head loss. 0 disables aux loss even if dual-head is enabled.')
+    parser.add_argument('--disc-use-expert-weights', action='store_true',
+                    help='Use expert weights in discriminator expert loss (weighted discriminator). Default off.')
+
     args = parser.parse_args()
 
     ##__PREF_INIT__
@@ -678,15 +704,24 @@ type=int)
     config['n_episodes'] = args.n_episodes
     config['sparse'] = False
 
+    config['disc_dualhead'] = bool(getattr(args, 'disc_dualhead', False))
+    config['disc_aux_weight'] = float(getattr(args, 'disc_aux_weight', 0.0))
+    config['disc_use_expert_weights'] = bool(getattr(args, 'disc_use_expert_weights', False))
+
     # >>> Additive BPref->Disc settings (only used if --add-pref-to-disc is set)
     config['add_pref_to_disc'] = bool(args.add_pref_to_disc)
 
     # >>> New: preference-reweighted teacher buffer flag
     config['pref_reweight_teacher'] = bool(getattr(args, 'pref_reweight_teacher', False))
 
+    # >>> NEW: preference ranking regularizer for discriminator
+    config['pref_rank_disc'] = bool(getattr(args, 'pref_rank_disc', False))
+    config['pref_rank_weight'] = float(getattr(args, 'pref_rank_weight', 0.0))
+    config['pref_rank_batch_size'] = int(getattr(args, 'pref_rank_batch_size', 32))
+
     # Common pref-RM config fields (used by add-pref-to-disc AND pref-reweight-teacher)
     # We only expect SAIL code to actually *use* them when the corresponding flags are True.
-    if config['add_pref_to_disc'] or config['pref_reweight_teacher']:
+    if config.get('add_pref_to_disc', False) or config.get('pref_reweight_teacher', False) or config.get('pref_rank_disc', False):
         config['pref_rm_path'] = args.pref_rm
         config['pref_expect_obs_dim'] = args.pref_expect_obs_dim
         config['pref_norm'] = args.pref_norm          # 'zscore' | 'iqr-match' | 'none'
@@ -803,12 +838,24 @@ type=int)
     if 'env_wrapper' in hyperparams.keys():
         del hyperparams['env_wrapper']
 
-    model = ALGOS[args.algo](
-        policy,
-        env=env,
-        verbose=args.verbose,
-        expert_data_path=data_save_dir,
-        **hyperparams)
+    # model = ALGOS[args.algo](
+    #     policy,
+    #     env=env,
+    #     verbose=args.verbose,
+    #     expert_data_path=data_save_dir,
+    #     _init_setup_model=False,
+    #     **hyperparams)
+    model_kwargs = dict(
+    env=env,
+    verbose=args.verbose,
+    expert_data_path=data_save_dir,
+    **hyperparams
+    )
+
+    if args.algo in ["sail", "dualsail"]:   # add other SAIL-derived ones you have
+        model_kwargs["_init_setup_model"] = False
+
+    model = ALGOS[args.algo](policy, **model_kwargs)
     print("Model buit successfully.")
     ##############################################################
     # begin learning, saving best model through each call back

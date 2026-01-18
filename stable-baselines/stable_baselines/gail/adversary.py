@@ -496,7 +496,8 @@ class TransitionCuriosityClassifier(object):
 
 class DiscriminatorCalssifier(object):
     def __init__(self, observation_space, action_space, hidden_size,
-                 entcoeff=0.001, gradcoeff=0.001,scope="adversary", normalize=True):
+                 entcoeff=0.001, gradcoeff=0.001, scope="adversary", normalize=True,
+                 dualhead=False, aux_weight=0.0, use_expert_weights=False):
         """
         Reward regression from observations and transitions
 
@@ -527,6 +528,10 @@ class DiscriminatorCalssifier(object):
         self.normalize = normalize
         self.obs_rms = None
 
+        self.dualhead = bool(dualhead)
+        self.aux_weight = float(aux_weight)
+        self.use_expert_weights = bool(use_expert_weights)
+
         # Placeholders
         self.generator_obs_ph = tf.placeholder(tf.float32, (None,) + self.observation_shape,
                                                name="gail_observations_ph")
@@ -539,14 +544,90 @@ class DiscriminatorCalssifier(object):
         
         self.expert_w_ph = tf.placeholder(tf.float32, (None, 1),
                                           name="gail_expert_weights_ph")
+        
+        # ===== Preference-pair placeholders (full-episode) =====
+        # Each is padded to [B, T_max, ...] with a mask [B, T_max]
+        self.pref_pos_obs_ph = tf.placeholder(tf.float32, (None, None) + self.observation_shape,
+                                            name="pref_pos_obs_ph")
+        self.pref_pos_acs_ph = tf.placeholder(action_space.dtype, (None, None) + self.actions_shape,
+                                            name="pref_pos_acs_ph")
+        self.pref_pos_mask_ph = tf.placeholder(tf.float32, (None, None),
+                                            name="pref_pos_mask_ph")
+
+        self.pref_neg_obs_ph = tf.placeholder(tf.float32, (None, None) + self.observation_shape,
+                                            name="pref_neg_obs_ph")
+        self.pref_neg_acs_ph = tf.placeholder(action_space.dtype, (None, None) + self.actions_shape,
+                                            name="pref_neg_acs_ph")
+        self.pref_neg_mask_ph = tf.placeholder(tf.float32, (None, None),
+                                            name="pref_neg_mask_ph")
+
+        # Weight for preference regularization (0 disables completely)
+        self.pref_loss_weight = tf.placeholder_with_default(0.0, shape=(), name="pref_loss_weight")
 
         # Build graph
         generator_input = self.flatten(self.generator_obs_ph, self.generator_acs_ph, reuse=False)
         generator_input = tf.stop_gradient(generator_input)
-        generator_logits = self.build_GAN_graph(generator_input, reuse=False)
+        gen_out = self.build_GAN_graph(generator_input, reuse=False)
 
         expert_input = self.flatten(self.expert_obs_ph, self.expert_acs_ph, reuse=True)
-        expert_logits = self.build_GAN_graph(expert_input, reuse=True)
+        exp_out = self.build_GAN_graph(expert_input, reuse=True)
+
+        if self.dualhead:
+            generator_logits, generator_aux_logits = gen_out
+            expert_logits, expert_aux_logits = exp_out
+        else:
+            generator_logits = gen_out
+            expert_logits = exp_out
+            generator_aux_logits, expert_aux_logits = None, None
+
+
+        # ===== Preference-pair loss graph =====
+        pref_loss = tf.constant(0.0)
+
+        def _disc_step_reward(obs_bt, acs_bt):
+            """
+            obs_bt: [B, T, obs_dim]
+            acs_bt: [B, T, act_dim]  (or discrete)
+            returns: [B, T] scalar reward per timestep from discriminator
+            """
+            B = tf.shape(obs_bt)[0]
+            T = tf.shape(obs_bt)[1]
+
+            obs_flat = tf.reshape(obs_bt, (-1,) + self.observation_shape)
+
+            if self.discrete_actions:
+                # acs_bt expected to be int-like; reshape to [-1]
+                acs_flat = tf.reshape(acs_bt, (-1,))
+            else:
+                acs_flat = tf.reshape(acs_bt, (-1,) + self.actions_shape)
+
+            flat_inp = self.flatten(obs_flat, acs_flat, reuse=True)  # reuse disc weights
+            out = self.build_GAN_graph(flat_inp, reuse=True)
+
+            if self.dualhead:
+                logits = out[0]
+            else:
+                logits = out
+
+            # same reward as policy uses: -log(1 - D(s,a))
+            r = -tf.log(1 - tf.nn.sigmoid(logits) + 1e-8)  # shape [B*T, 1]
+            r = tf.reshape(r, (B, T))                      # [B, T]
+            return r
+
+        # Compute episodic scores as masked sum of per-step disc rewards
+        r_pos_bt = _disc_step_reward(self.pref_pos_obs_ph, self.pref_pos_acs_ph)  # [B,T]
+        r_neg_bt = _disc_step_reward(self.pref_neg_obs_ph, self.pref_neg_acs_ph)  # [B,T]
+
+        J_pos = tf.reduce_sum(r_pos_bt * self.pref_pos_mask_ph, axis=1)  # [B]
+        J_neg = tf.reduce_sum(r_neg_bt * self.pref_neg_mask_ph, axis=1)  # [B]
+
+        # Bradley-Terry / logistic preference loss: want J_pos > J_neg
+        # loss = log(1 + exp(-(J_pos - J_neg)))
+        pref_pair_loss = tf.nn.softplus(-(J_pos - J_neg))  # [B]
+        pref_loss = tf.reduce_mean(pref_pair_loss)
+
+        # apply weight (can be 0)
+        pref_loss = self.pref_loss_weight * pref_loss
 
         # Build accuracy
         generator_acc = tf.reduce_mean(tf.cast(tf.nn.sigmoid(generator_logits) < 0.5, tf.float32))
@@ -578,8 +659,35 @@ class DiscriminatorCalssifier(object):
         weights = self.expert_w_ph  # [N, 1]
 
         # Weighted expert loss: sum(w_i * loss_i) / sum(w_i)
-        weighted_expert_loss = sample_expert_loss * weights
-        expert_loss = tf.reduce_sum(weighted_expert_loss) / (tf.reduce_sum(weights) + 1e-8)
+        if self.use_expert_weights:
+            weighted_expert_loss = sample_expert_loss * weights
+            expert_loss = tf.reduce_sum(weighted_expert_loss) / (tf.reduce_sum(weights) + 1e-8)
+        else:
+            expert_loss = tf.reduce_mean(sample_expert_loss)
+
+        # -------------------- INSERT CHANGE HERE --------------------
+        aux_loss = tf.constant(0.0)
+
+        if self.dualhead and (self.aux_weight > 0.0):
+            sample_generator_aux_loss = tf.nn.sigmoid_cross_entropy_with_logits(
+                logits=generator_aux_logits,
+                labels=tf.zeros_like(generator_aux_logits)
+            )
+            sample_expert_aux_loss = tf.nn.sigmoid_cross_entropy_with_logits(
+                logits=expert_aux_logits,
+                labels=tf.ones_like(expert_aux_logits)
+            )
+
+            gen_aux_loss = tf.reduce_mean(sample_generator_aux_loss)
+
+            sample_expert_aux_loss = tf.reshape(sample_expert_aux_loss, (-1, 1))
+            if self.use_expert_weights:
+                exp_aux_loss = tf.reduce_sum(sample_expert_aux_loss * weights) / (tf.reduce_sum(weights) + 1e-8)
+            else:
+                exp_aux_loss = tf.reduce_mean(sample_expert_aux_loss)
+
+            aux_loss = self.aux_weight * (gen_aux_loss + exp_aux_loss)
+        # -------------------------------------------------------------
 
         # Build entropy loss
         logits = tf.concat([generator_logits, expert_logits], 0)
@@ -587,21 +695,37 @@ class DiscriminatorCalssifier(object):
         entropy_loss = -entcoeff * entropy
         # Build Gradient-penalty loss
         alpha_shape = self.observation_shape[0] + self.n_actions
-        alpha = np.random.uniform(size=(1, alpha_shape))
+        # alpha = np.random.uniform(size=(1, alpha_shape))
+        alpha = tf.random_uniform(shape=(tf.shape(generator_input)[0], 1), minval=0.0, maxval=1.0)
         #inter = tf.multiply(generator_input ) + tf.multiply(expert_input, 1 - alpha) 
         inter = alpha * generator_input + (1 - alpha) * expert_input 
-        with tf.GradientTape() as tape2:
-            tape2.watch(inter)
-            inter_output = self.build_GAN_graph(inter, reuse=True)
-            grad = tape2.gradient(inter_output, [inter])[0]
-            grad = tf.pow(tf.norm(grad, axis=-1) - 1, 2)
-            grad = tf.reduce_mean(grad)
-        grad_penalty = gradcoeff * grad
+        # with tf.GradientTape() as tape2:
+        #     tape2.watch(inter)
+        #     inter_out = self.build_GAN_graph(inter, reuse=True)
+
+        #     # If dualhead, take ONLY the main head for gradient penalty
+        #     if self.dualhead:
+        #         inter_logits = inter_out[0]
+        #     else:
+        #         inter_logits = inter_out
+
+        #     grad = tape2.gradient(inter_logits, [inter])[0]
+        #     grad = tf.pow(tf.norm(grad, axis=-1) - 1, 2)
+        #     grad = tf.reduce_mean(grad)
+        # grad_penalty = gradcoeff * grad
+        inter_out = self.build_GAN_graph(inter, reuse=True)
+        inter_logits = inter_out[0] if self.dualhead else inter_out  # [?,1]
+
+        # TF1 gradient penalty: ||d logit / d inter||2
+        grad = tf.gradients(inter_logits, [inter])[0]               # [?, alpha_shape]
+        grad = tf.sqrt(tf.reduce_sum(tf.square(grad), axis=1) + 1e-8)  # [?,]
+        grad_pen = tf.reduce_mean(tf.square(grad - 1.0))               # scalar
+        grad_penalty = gradcoeff * grad_pen
 
         # Loss + Accuracy terms
-        self.losses = [generator_loss, expert_loss, entropy, entropy_loss, generator_acc, expert_acc, grad_penalty]
-        self.loss_name = ["generator_loss", "expert_loss", "entropy", "entropy_loss", "generator_acc", "expert_acc", "grad_penalty_loss"]
-        self.total_loss = generator_loss + expert_loss + entropy_loss + grad_penalty
+        self.losses = [generator_loss, expert_loss, entropy, entropy_loss, generator_acc, expert_acc, grad_penalty, aux_loss, pref_loss]
+        self.loss_name = ["generator_loss", "expert_loss", "entropy", "entropy_loss", "generator_acc", "expert_acc", "grad_penalty_loss", "aux_loss", "pref_loss"]
+        self.total_loss = generator_loss + expert_loss + entropy_loss + grad_penalty + aux_loss + pref_loss
 
         #  # ----- L2 weight decay over discriminator parameters -----
         # disc_vars = self.get_trainable_variables()
@@ -642,6 +766,19 @@ class DiscriminatorCalssifier(object):
         self.lossandgrad = tf_util.function(
             [self.generator_obs_ph, self.generator_acs_ph, self.expert_obs_ph, self.expert_acs_ph, self.expert_w_ph,],
             self.losses + [tf_util.flatgrad(self.total_loss, var_list)])
+        # self.lossandgrad = tf_util.function(
+        #     [
+        #         self.generator_obs_ph, self.generator_acs_ph,
+        #         self.expert_obs_ph, self.expert_acs_ph,
+        #         self.expert_w_ph,
+
+        #         # pref ranking inputs
+        #         self.pref_pos_obs_ph, self.pref_pos_acs_ph, self.pref_pos_mask_ph,
+        #         self.pref_neg_obs_ph, self.pref_neg_acs_ph, self.pref_neg_mask_ph,
+        #         self.pref_loss_weight,
+        #     ],
+        #     self.losses + [tf_util.flatgrad(self.total_loss, var_list)]
+        # )
 
     def flatten(self, obs_ph, acs_ph, reuse=False):
         with tf.variable_scope(self.scope):
@@ -690,6 +827,12 @@ class DiscriminatorCalssifier(object):
             p_h1 = tf.contrib.layers.fully_connected(inputs, self.hidden_size, activation_fn=tf.nn.tanh)
             p_h2 = tf.contrib.layers.fully_connected(p_h1, self.hidden_size, activation_fn=tf.nn.tanh)
             logits = tf.contrib.layers.fully_connected(p_h2, 1, activation_fn=tf.identity) 
+
+            # Aux head (optional)
+            if self.dualhead:
+                aux_logits = tf.contrib.layers.fully_connected(p_h2, 1, activation_fn=tf.identity)
+                return logits, aux_logits
+
         return logits 
 
 
