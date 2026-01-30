@@ -24,7 +24,7 @@ VENV=$HOME/.venvs/sail-tf1b
 
 # Legacy teacher dataset you want to use (real file)
 EPISODES=4
-ORIG_DATASET="${REPO_ROOT}/stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_1500_episodes_4_legacy_exact.npz"
+ORIG_DATASET="${REPO_ROOT}/stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_500_episodes_4_legacy_exact.npz"
 
 # IMPORTANT: this must match what train_sail.py expects:
 # ../../teacher_dataset/expert_data_no_img_HalfCheetah_scores_5600_episodes_${EPISODES}.npz

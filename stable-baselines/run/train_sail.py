@@ -544,6 +544,69 @@ if __name__ == '__main__':
         help='Number of preference pairs per discriminator update (Bp).'
     )
 
+    # --- NEW: soft ranking target from reward-model scores ---
+    parser.add_argument('--pref-soft-rank-disc', action='store_true',
+        help='Use soft BT target from reward-model scores J (sigma((Jpos-Jneg)/T)) to supervise disc ranking.')
+    parser.add_argument('--pref-soft-rank-weight', type=float, default=0.0,
+        help='Weight for soft ranking loss (added to discriminator total loss).')
+    parser.add_argument('--pref-soft-rank-temp', type=float, default=1.0,
+        help='Temperature T for soft preference target: sigma((Jpos-Jneg)/T).')
+    
+
+    # ============================================================
+    # EXPERIMENT: preference-pair filtering for DISC ranking loss
+    # (default OFF; does not affect other runs unless enabled)
+    # ============================================================
+    parser.add_argument(
+        '--pref-pair-filter',
+        type=str,
+        default='none',
+        choices=['none', 'disc_sim_rm_diff', 'disc_opp_rm_diff', 'disc_disagree_rm'],
+        help=(
+            "Filter preference pairs used for DISC ranking loss. "
+            "'none' = random pairs. "
+            "'disc_sim_rm_diff' = |ΔD| small but |ΔJ| large. "
+            "'disc_opp_rm_diff' = |ΔD| large and |ΔJ| large. "
+            "'disc_disagree_rm' = disc ordering disagrees with RM ordering (and both have clear prefs)."
+        )
+    )
+    parser.add_argument(
+        '--pref-pair-filter-disc-delta-max',
+        type=float,
+        default=0.5,
+        help="For disc_sim_rm_diff: maximum allowed |ΔJ_disc| for a pair to be accepted."
+    )
+    parser.add_argument(
+        '--pref-pair-filter-rm-delta-min',
+        type=float,
+        default=2.0,
+        help="For disc_sim_rm_diff: minimum required |ΔJ_rm| for a pair to be accepted."
+    )
+    parser.add_argument(
+        '--pref-pair-filter-tries',
+        type=int,
+        default=2000,
+        help="How many random candidate pairs to try to fill a batch before falling back."
+    )
+    parser.add_argument(
+        '--pref-pair-filter-refresh-freq',
+        type=int,
+        default=5000,
+        help="How often (in env steps) to recompute cached episode J_disc values for filtering."
+    )
+    parser.add_argument(
+        '--pref-pair-filter-fallback',
+        action='store_true',
+        help="If enabled, allow fallback to default random pair sampling when filtering can't fill a batch."
+    )
+
+    parser.add_argument(
+        '--pref-pair-filter-disc-delta-min',
+        type=float,
+        default=0.15,
+        help="For disc_opp_rm_diff/disc_disagree_rm: minimum required |ΔJ_disc|."
+    )
+
 
     parser.add_argument('--env', type=str, default="PongNoFrameskip-v4", help='environment ID')
     parser.add_argument('-tb', '--tensorboard-log', help='Tensorboard log dir', default='tb_logs', type=str)
@@ -719,9 +782,36 @@ type=int)
     config['pref_rank_weight'] = float(getattr(args, 'pref_rank_weight', 0.0))
     config['pref_rank_batch_size'] = int(getattr(args, 'pref_rank_batch_size', 32))
 
+    # >>> EXPERIMENT: preference-pair filtering for DISC ranking loss
+    config['pref_pair_filter'] = str(getattr(args, 'pref_pair_filter', 'none'))
+    config['pref_pair_filter_disc_delta_max'] = float(getattr(args, 'pref_pair_filter_disc_delta_max', 0.5))
+    config['pref_pair_filter_rm_delta_min'] = float(getattr(args, 'pref_pair_filter_rm_delta_min', 2.0))
+    config['pref_pair_filter_tries'] = int(getattr(args, 'pref_pair_filter_tries', 2000))
+    config['pref_pair_filter_refresh_freq'] = int(getattr(args, 'pref_pair_filter_refresh_freq', 5000))
+    config['pref_pair_filter_fallback'] = bool(getattr(args, 'pref_pair_filter_fallback', False))
+    config['pref_pair_filter_disc_delta_min'] = float(getattr(args, 'pref_pair_filter_disc_delta_min', 0.30))
+
+    config['pref_soft_rank_disc'] = bool(args.pref_soft_rank_disc)
+    config['pref_soft_rank_weight'] = float(args.pref_soft_rank_weight)
+    config['pref_soft_rank_temp'] = float(args.pref_soft_rank_temp)
+
     # Common pref-RM config fields (used by add-pref-to-disc AND pref-reweight-teacher)
     # We only expect SAIL code to actually *use* them when the corresponding flags are True.
-    if config.get('add_pref_to_disc', False) or config.get('pref_reweight_teacher', False) or config.get('pref_rank_disc', False):
+    # Common pref-RM config fields (used by add-pref-to-disc AND pref-reweight-teacher AND rank/filter)
+    need_pref_rm = (
+        config.get('add_pref_to_disc', False)
+        or config.get('pref_reweight_teacher', False)
+        or config.get('pref_rank_disc', False)
+        or (str(getattr(args, 'pref_pair_filter', 'none')) != 'none')
+    )
+
+    if need_pref_rm:
+        if args.pref_rm is None:
+            raise ValueError(
+                "A preference RM is required (either because a pref feature is enabled or "
+                "--pref-pair-filter != none), but --pref-rm was not provided."
+            )
+
         config['pref_rm_path'] = args.pref_rm
         config['pref_expect_obs_dim'] = args.pref_expect_obs_dim
         config['pref_norm'] = args.pref_norm          # 'zscore' | 'iqr-match' | 'none'

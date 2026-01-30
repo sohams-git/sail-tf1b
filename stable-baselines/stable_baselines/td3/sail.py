@@ -464,7 +464,13 @@ class SAIL(OffPolicyRLModel):
             print("[SAIL:pref-reweight] WARNING: config is None; cannot load pref RM.")
             return None
 
-        if not (cfg.get('pref_reweight_teacher', False) or cfg.get('pref_rank_disc', False)):
+        pair_filter = str(cfg.get('pref_pair_filter', 'none'))
+        need_rm = (
+            cfg.get('pref_reweight_teacher', False)
+            or cfg.get('pref_rank_disc', False)
+            or (pair_filter != 'none')
+        )
+        if not need_rm:
             return None
 
         path = cfg.get('pref_rm_path', None)
@@ -663,7 +669,242 @@ class SAIL(OffPolicyRLModel):
             neg_acs[i, :LN] = epN['acs'][:LN]
             neg_mask[i, :LN] = 1.0
 
-        return pos_obs, pos_acs, pos_mask, neg_obs, neg_acs, neg_mask
+        pos_J = np.array([float(ep.get('J', 0.0)) for ep in pos_eps], dtype=np.float32).reshape(-1, 1)
+        neg_J = np.array([float(ep.get('J', 0.0)) for ep in neg_eps], dtype=np.float32).reshape(-1, 1)
+
+        return pos_obs, pos_acs, pos_mask, neg_obs, neg_acs, neg_mask, pos_J, neg_J
+
+    #-----------
+    def _disc_episode_score(self, obs_ep, acs_ep):
+        # """
+        # Scalar discriminator score for a whole episode.
+        # Uses mean discriminator probability p(s,a) over steps.
+        # """
+        # get_confidence returns (_, p) where p is prob expert (usually)
+        _, p = self.discriminator.get_confidence(obs_ep, acs_ep, sess=self.sess)
+        p = np.asarray(p).reshape(-1)
+        return float(p.mean())
+
+    def _kendall_tau_b_from_pair_stats(self, P, Q, X0, Y0):
+        denom = (P + Q + X0) * (P + Q + Y0)
+        if denom <= 0:
+            return 0.0
+        return float((P - Q) / (np.sqrt(denom) + 1e-12))
+
+    def _sample_filtered_pref_pairs(self, B, step=None, max_tries=2000):
+        """
+        Pair filter hook:
+        - pref_pair_filter == 'none' -> fallback to uniform pairs (old behavior)
+        - pref_pair_filter == 'disc_sim_rm_diff' -> |D(a)-D(b)| small, |J(a)-J(b)| large
+        - pref_pair_filter == 'disc_opp_rm_diff' -> |D(a)-D(b)| large, |J(a)-J(b)| large
+        Returns SAME format as _sample_full_episode_pref_pairs:
+        pos_obs, pos_acs, pos_mask, neg_obs, neg_acs, neg_mask, pos_J, neg_J
+        """
+        cfg = self.config
+        mode = str(cfg.get("pref_pair_filter", "none"))
+
+        # default behavior: no filtering
+        if mode == "none":
+            return self._sample_full_episode_pref_pairs(B)
+        
+        # ---------------- cache refresh (ONLY matters in filtered mode) ----------------
+        refresh_freq = int(cfg.get("pref_pair_filter_refresh_freq", 0))
+        if refresh_freq and refresh_freq > 0:
+            last = int(getattr(self, "_pref_pair_filter_last_refresh", -1))
+            if (step is not None) and (last < 0 or (step - last) >= refresh_freq):
+                if hasattr(self, "_disc_ep_score_cache"):
+                    self._disc_ep_score_cache = {}
+                self._pref_pair_filter_last_refresh = int(step)
+
+        eps = self.pref_teacher_episodes
+        if eps is None or len(eps) < 2:
+            return None
+
+        # thresholds (tunable via config) -- MUST match train_sail.py keys
+        disc_sim_eps = float(cfg.get("pref_pair_filter_disc_delta_max", 0.02))  # accept if |ΔD| <= this
+        rm_min_dJ    = float(cfg.get("pref_pair_filter_rm_delta_min", 10.0))    # require |ΔJ| >= this
+
+        # optional: only used for the "opp" mode; if not set, pick a reasonable default
+        disc_opp_min = float(cfg.get("pref_pair_filter_disc_delta_min", 0.30))  # accept if |ΔD| >= this
+
+        disc_uncertain_eps = float(cfg.get("pref_pair_filter_disc_uncertain_eps", disc_sim_eps))
+
+        # cache discriminator episode scores for speed
+        if not hasattr(self, "_disc_ep_score_cache"):
+            self._disc_ep_score_cache = {}
+
+        def disc_score(i):
+            if i in self._disc_ep_score_cache:
+                return self._disc_ep_score_cache[i]
+            d = self._disc_episode_score(eps[i]['obs'], eps[i]['acs'])
+            self._disc_ep_score_cache[i] = d
+            return d
+
+        N = len(eps)
+        pairs = []
+        max_tries = int(cfg.get("pref_pair_filter_tries", max_tries))
+        allow_fallback = bool(cfg.get("pref_pair_filter_fallback", True))
+        tries = 0
+
+        # ---- tau stats counters over accepted pairs ----
+        P = 0
+        Q = 0
+        X0 = 0
+        Y0 = 0
+
+        while len(pairs) < B and tries < max_tries:
+            tries += 1
+            a = np.random.randint(0, N)
+            b = np.random.randint(0, N)
+            if a == b:
+                continue
+
+            Da, Db = disc_score(a), disc_score(b)
+            Ja, Jb = float(eps[a].get("J", 0.0)), float(eps[b].get("J", 0.0))
+
+            
+
+            # require reward-model disagreement
+            # signed deltas (orderings)
+            dD_signed = (Da - Db)   # discriminator ordering
+            dJ_signed = (Ja - Jb)   # reward-model ordering
+            dD = abs(dD_signed)
+            dJ = abs(dJ_signed)
+
+            # core conditions
+            rm_has_clear_pref = (dJ > rm_min_dJ)
+
+            if mode == "disc_sim_rm_diff":
+                # disc says episodes are similar, RM says they differ a lot
+                accept = (dD <= disc_sim_eps) and rm_has_clear_pref
+
+            elif mode == "disc_opp_rm_diff":
+                # disc separates strongly, RM also differs strongly
+                accept = (dD >= disc_opp_min) and rm_has_clear_pref
+
+            elif mode == "disc_disagree_rm":
+                # (optional explicit mode) disc ordering disagrees with RM ordering
+                disc_has_clear_pref = (dD >= disc_opp_min)
+                accept = rm_has_clear_pref and disc_has_clear_pref and (dD_signed * dJ_signed < 0.0)
+
+            else:
+                # fallback: your old behavior (uncertain OR disagree)
+                # disc_uncertain_eps = float(cfg.get("pref_pair_filter_disc_uncertain_eps", 0.02))
+                disc_not_confident = (dD <= disc_uncertain_eps)
+                disc_has_clear_pref = (dD >= disc_opp_min)
+                rm_disc_disagree = rm_has_clear_pref and disc_has_clear_pref and (dD_signed * dJ_signed < 0.0)
+                accept = (disc_not_confident or rm_disc_disagree)
+
+            if not accept:
+                continue
+            # snapshot the *first accepted* pair for correct debug printing
+            if len(pairs) == 0:
+                first_accept_dbg = (Da, Db, Ja, Jb, abs(Da - Db), abs(Ja - Jb))
+            
+            # -------- tau-b bookkeeping on the accepted pair --------
+            rm_tie_eps   = float(cfg.get("pref_pair_filter_rm_tie_eps", 1.0))      # or keep fixed 1.0
+            disc_tie_eps = float(cfg.get("pref_pair_filter_disc_tie_eps", disc_sim_eps))  # pick something sensible
+
+            disc_tie = (abs(dD_signed) <= disc_tie_eps)
+            rm_tie   = (abs(dJ_signed) <= rm_tie_eps)
+
+            # 1) Concordant/discordant only (no explicit tie gating)
+            prod = dD_signed * dJ_signed
+            if prod > 0.0:
+                P += 1
+            elif prod < 0.0:
+                Q += 1
+            # else prod == 0 -> at least one is tied -> do nothing for P/Q
+
+            # 2) Tie correction counts (tau-b)
+            #    X0: RM ties while Disc orders
+            #    Y0: Disc ties while RM orders
+            if rm_tie and (not disc_tie):
+                X0 += 1
+            elif disc_tie and (not rm_tie):
+                Y0 += 1
+            # if both tied -> neither X0 nor Y0 (correct for tau-b)
+
+            pairs.append((a, b))
+
+        # ---- sanity: show first accepted pair stats ----
+        # ---- sanity: show first accepted pair stats (CORRECT) ----
+        if len(pairs) == 1 and 'first_accept_dbg' in locals():
+            Da0, Db0, Ja0, Jb0, dD0, dJ0 = first_accept_dbg
+            print(
+                f"[pref-filter] accepted first pair: mode={mode} "
+                f"dD={dD0:.4f} dJ={dJ0:.2f} "
+                f"Da={Da0:.4f} Db={Db0:.4f} Ja={Ja0:.2f} Jb={Jb0:.2f} "
+                f"disc_sim_eps={disc_sim_eps} disc_opp_min={disc_opp_min} rm_min_dJ={rm_min_dJ}"
+            )
+
+        if len(pairs) < B:
+            # ---- sanity: explain why we failed ----
+            print(
+                f"[pref-filter] FAILED to fill batch: got={len(pairs)}/{B} "
+                f"tries={tries}/{max_tries} mode={mode} "
+                f"disc_sim_eps={disc_sim_eps} disc_opp_min={disc_opp_min} rm_min_dJ={rm_min_dJ} "
+                f"fallback={allow_fallback} N_eps={N}"
+            )
+            # not enough filtered pairs
+            if allow_fallback:
+                return self._sample_full_episode_pref_pairs(B)
+            else:
+                return None
+
+
+        tau_b = self._kendall_tau_b_from_pair_stats(P, Q, X0, Y0)
+
+        tau_stats = {
+            "tau_b": tau_b,
+            "P": int(P), "Q": int(Q), "X0": int(X0), "Y0": int(Y0),
+            "tries_used": int(tries),
+            "accepted": int(len(pairs)),
+            "B": int(B),
+        }
+
+        # Build pos/neg ordering by J
+        pos_eps, neg_eps = [], []
+        for a, b in pairs:
+            Ja = float(eps[a].get('J', 0.0))
+            Jb = float(eps[b].get('J', 0.0))
+            if Ja >= Jb:
+                pos_eps.append(eps[a]); neg_eps.append(eps[b])
+            else:
+                pos_eps.append(eps[b]); neg_eps.append(eps[a])
+
+        # padding logic (copied from _sample_full_episode_pref_pairs)
+        def _len(ep): return int(ep['acs'].shape[0])
+        Lmax = max(max(_len(ep) for ep in pos_eps), max(_len(ep) for ep in neg_eps))
+
+        obs_dim = pos_eps[0]['obs'].shape[1]
+        act_dim = pos_eps[0]['acs'].shape[1]
+
+        pos_obs  = np.zeros((B, Lmax, obs_dim), dtype=np.float32)
+        pos_acs  = np.zeros((B, Lmax, act_dim), dtype=np.float32)
+        pos_mask = np.zeros((B, Lmax), dtype=np.float32)
+
+        neg_obs  = np.zeros((B, Lmax, obs_dim), dtype=np.float32)
+        neg_acs  = np.zeros((B, Lmax, act_dim), dtype=np.float32)
+        neg_mask = np.zeros((B, Lmax), dtype=np.float32)
+
+        for i in range(B):
+            epP, epN = pos_eps[i], neg_eps[i]
+            LP, LN = _len(epP), _len(epN)
+
+            pos_obs[i, :LP] = epP['obs'][:LP]
+            pos_acs[i, :LP] = epP['acs'][:LP]
+            pos_mask[i, :LP] = 1.0
+
+            neg_obs[i, :LN] = epN['obs'][:LN]
+            neg_acs[i, :LN] = epN['acs'][:LN]
+            neg_mask[i, :LN] = 1.0
+
+        pos_J = np.array([float(ep.get('J', 0.0)) for ep in pos_eps], dtype=np.float32).reshape(-1, 1)
+        neg_J = np.array([float(ep.get('J', 0.0)) for ep in neg_eps], dtype=np.float32).reshape(-1, 1)
+
+        return pos_obs, pos_acs, pos_mask, neg_obs, neg_acs, neg_mask, pos_J, neg_J, tau_stats
+    #-----------
 
     def generate_discriminator_data(self, mode=None):
         # Sample expert transitions + per-sample weights
@@ -702,6 +943,7 @@ class SAIL(OffPolicyRLModel):
         # NOTE: uses only the last g step for observation
         d_losses = []  # list of tuples, each of which gives the loss for a minibatch
         for i in range(self.d_gradient_steps):
+            tau_stats = None
             ob_expert, ac_expert, ob_batch, ac_batch, expert_w = self.generate_discriminator_data(shaping_mode)
 
             feed_dict = {
@@ -714,40 +956,98 @@ class SAIL(OffPolicyRLModel):
             }
 
             # ------------------- preference ranking regularizer (full episodes) -------------------
-            if self.config.get('pref_rank_disc', False):
-                w_pref = float(self.config.get('pref_rank_weight', 0.0))
-                Bp = int(self.config.get('pref_rank_batch_size', 32))
+            use_hard = bool(self.config.get('pref_rank_disc', False))
+            w_hard = float(self.config.get('pref_rank_weight', 0.0)) if use_hard else 0.0
+            Bp = int(self.config.get('pref_rank_batch_size', 32))
 
-                # Only run if weight > 0 and we have teacher episodes with J
-                if (w_pref > 0.0) and (self.pref_teacher_episodes is not None) and (len(self.pref_teacher_episodes) >= 2):
-                    pair = self._sample_full_episode_pref_pairs(Bp)
-                    if pair is not None:
+            # Default: disable both losses for this discriminator iter
+            feed_dict.update({
+                self.discriminator.pref_loss_weight: 0.0,     # hard loss weight
+                # self.discriminator.pref_soft_weight: 0.0,     # soft loss weight (NEW) turn this on when using the disc rew for pref loss
+                self.discriminator.pref_rm_loss_weight: 0.0,     # RM-pref loss weight
+                
+
+            })
+
+            # Run if either hard or soft is requested and actually weighted
+            if (w_hard > 0.0) and (self.pref_teacher_episodes is not None) and (len(self.pref_teacher_episodes) >= 2):
+                pair = self._sample_filtered_pref_pairs(Bp, step=step)
+
+                if pair is not None:
+                    tau_stats = None
+                    # NOTE: for soft loss we want pos_J/neg_J too
+                    # so update _sample_full_episode_pref_pairs() to return (.., pos_J, neg_J)
+                    if len(pair) == 6:
                         pos_obs, pos_acs, pos_mask, neg_obs, neg_acs, neg_mask = pair
+                        pos_J = neg_J = None
 
-                        
+                    elif len(pair) == 8:
+                        pos_obs, pos_acs, pos_mask, neg_obs, neg_acs, neg_mask, pos_J, neg_J = pair
 
-                        feed_dict.update({
-                            self.discriminator.pref_pos_obs_ph: pos_obs,
-                            self.discriminator.pref_pos_acs_ph: pos_acs,
-                            self.discriminator.pref_pos_mask_ph: pos_mask,
-                            self.discriminator.pref_neg_obs_ph: neg_obs,
-                            self.discriminator.pref_neg_acs_ph: neg_acs,
-                            self.discriminator.pref_neg_mask_ph: neg_mask,
-                            self.discriminator.pref_loss_weight: w_pref,
-                        })
                     else:
-                        # no valid pair batch -> disable this iter
-                        feed_dict.update({self.discriminator.pref_loss_weight: 0.0})
-                else:
-                    feed_dict.update({self.discriminator.pref_loss_weight: 0.0})
-            else:
-                feed_dict.update({self.discriminator.pref_loss_weight: 0.0})
-        # -------------------------------------------------------------------------------------
+                        # NEW: includes tau_stats as last element
+                        pos_obs, pos_acs, pos_mask, neg_obs, neg_acs, neg_mask, pos_J, neg_J, tau_stats = pair
+
+
+                    # If your sampler outputs [B,T,1], squeeze to [B,T]
+                    if pos_mask.ndim == 3:
+                        pos_mask = pos_mask[:, :, 0]
+                    if neg_mask.ndim == 3:
+                        neg_mask = neg_mask[:, :, 0]
+
+                    # Always feed the episode tensors when either loss is active
+                    feed_dict.update({
+                        self.discriminator.pref_pos_obs_ph: pos_obs,
+                        self.discriminator.pref_pos_acs_ph: pos_acs,
+                        self.discriminator.pref_pos_mask_ph: pos_mask,
+                        self.discriminator.pref_neg_obs_ph: neg_obs,
+                        self.discriminator.pref_neg_acs_ph: neg_acs,
+                        self.discriminator.pref_neg_mask_ph: neg_mask,
+                    })
+
+                    # -------- existing hard loss weight --------
+                    if w_hard > 0.0:
+                        feed_dict.update({self.discriminator.pref_loss_weight: w_hard})
+
+                    # # -------- NEW soft loss target + weight --------
+                    # if (w_soft > 0.0) and (pos_J is not None) and (neg_J is not None):
+                    #     T = float(self.config.get('pref_soft_rank_temp', 1.0))
+                    #     T = max(T, 1e-6)
+
+                    #     # p_rm = sigmoid((Jpos - Jneg)/T)  shape [B,1]
+                    #     delta = (pos_J - neg_J) / T
+                    #     p_rm = 1.0 / (1.0 + np.exp(-delta))
+
+                    #     feed_dict.update({
+                    #         self.discriminator.pref_soft_target_ph: p_rm.astype(np.float32),
+                    #         self.discriminator.pref_soft_weight: float(w_soft),
+                    #     })
+# -------------------------------------------------------------------------------------
 
             if (i == 0) and (step % 5000 == 0):  # occasional debug
                 active = float(feed_dict.get(self.discriminator.pref_loss_weight, 0.0))
                 n_eps = 0 if self.pref_teacher_episodes is None else len(self.pref_teacher_episodes)
                 print(f"[pref-rank] step={step} active_w={active} n_teacher_eps={n_eps}")
+
+            if tau_stats is not None and (i == 0):
+                print(
+                    f"[pref-tau] step={step} tau_b={tau_stats['tau_b']:.4f} "
+                    f"P={tau_stats['P']} Q={tau_stats['Q']} X0={tau_stats['X0']} Y0={tau_stats['Y0']} "
+                    f"acc={tau_stats['accepted']}/{tau_stats['B']} tries={tau_stats['tries_used']}"
+                )
+
+                # TensorBoard scalars (only if writer exists)
+                if writer is not None:
+                    summ = tf.Summary(value=[
+                        tf.Summary.Value(tag="pref_filter/tau_b", simple_value=float(tau_stats["tau_b"])),
+                        tf.Summary.Value(tag="pref_filter/P", simple_value=float(tau_stats["P"])),
+                        tf.Summary.Value(tag="pref_filter/Q", simple_value=float(tau_stats["Q"])),
+                        tf.Summary.Value(tag="pref_filter/X0", simple_value=float(tau_stats["X0"])),
+                        tf.Summary.Value(tag="pref_filter/Y0", simple_value=float(tau_stats["Y0"])),
+                        tf.Summary.Value(tag="pref_filter/tries_used", simple_value=float(tau_stats["tries_used"])),
+                        tf.Summary.Value(tag="pref_filter/accepted", simple_value=float(tau_stats["accepted"])),
+                    ])
+                    writer.add_summary(summ, step)    
             if writer is not None:
                 run_ops = [self.gail_summary] + self.gail_sample_loss + self.gail_item_loss + [self.gail_total_loss, self.gail_train_op]
                 out = self.sess.run(run_ops, feed_dict)

@@ -547,22 +547,63 @@ class DiscriminatorCalssifier(object):
         
         # ===== Preference-pair placeholders (full-episode) =====
         # Each is padded to [B, T_max, ...] with a mask [B, T_max]
-        self.pref_pos_obs_ph = tf.placeholder(tf.float32, (None, None) + self.observation_shape,
-                                            name="pref_pos_obs_ph")
-        self.pref_pos_acs_ph = tf.placeholder(action_space.dtype, (None, None) + self.actions_shape,
-                                            name="pref_pos_acs_ph")
-        self.pref_pos_mask_ph = tf.placeholder(tf.float32, (None, None),
-                                            name="pref_pos_mask_ph")
+        # self.pref_pos_obs_ph = tf.placeholder(tf.float32, (None, None) + self.observation_shape,
+        #                                     name="pref_pos_obs_ph")
+        # self.pref_pos_acs_ph = tf.placeholder(action_space.dtype, (None, None) + self.actions_shape,
+        #                                     name="pref_pos_acs_ph")
+        # self.pref_pos_mask_ph = tf.placeholder(tf.float32, (None, None),
+        #                                     name="pref_pos_mask_ph")
 
-        self.pref_neg_obs_ph = tf.placeholder(tf.float32, (None, None) + self.observation_shape,
-                                            name="pref_neg_obs_ph")
-        self.pref_neg_acs_ph = tf.placeholder(action_space.dtype, (None, None) + self.actions_shape,
-                                            name="pref_neg_acs_ph")
-        self.pref_neg_mask_ph = tf.placeholder(tf.float32, (None, None),
-                                            name="pref_neg_mask_ph")
+        # self.pref_neg_obs_ph = tf.placeholder(tf.float32, (None, None) + self.observation_shape,
+        #                                     name="pref_neg_obs_ph")
+        # self.pref_neg_acs_ph = tf.placeholder(action_space.dtype, (None, None) + self.actions_shape,
+        #                                     name="pref_neg_acs_ph")
+        # self.pref_neg_mask_ph = tf.placeholder(tf.float32, (None, None),
+        #                                     name="pref_neg_mask_ph")
+
+        _default_pos_obs  = tf.zeros((1, 1) + self.observation_shape, dtype=tf.float32)
+        _default_pos_acs  = tf.zeros((1, 1) + self.actions_shape, dtype=tf.float32)
+        _default_pos_mask = tf.zeros((1, 1), dtype=tf.float32)
+
+        _default_neg_obs  = tf.zeros((1, 1) + self.observation_shape, dtype=tf.float32)
+        _default_neg_acs  = tf.zeros((1, 1) + self.actions_shape, dtype=tf.float32)
+        _default_neg_mask = tf.zeros((1, 1), dtype=tf.float32)
+
+        self.pref_pos_obs_ph = tf.placeholder_with_default(
+            _default_pos_obs, shape=(None, None) + self.observation_shape, name="pref_pos_obs_ph"
+        )
+        self.pref_pos_acs_ph = tf.placeholder_with_default(
+            _default_pos_acs, shape=(None, None) + self.actions_shape, name="pref_pos_acs_ph"
+        )
+        self.pref_pos_mask_ph = tf.placeholder_with_default(
+            _default_pos_mask, shape=(None, None), name="pref_pos_mask_ph"
+        )
+
+        self.pref_neg_obs_ph = tf.placeholder_with_default(
+            _default_neg_obs, shape=(None, None) + self.observation_shape, name="pref_neg_obs_ph"
+        )
+        self.pref_neg_acs_ph = tf.placeholder_with_default(
+            _default_neg_acs, shape=(None, None) + self.actions_shape, name="pref_neg_acs_ph"
+        )
+        self.pref_neg_mask_ph = tf.placeholder_with_default(
+            _default_neg_mask, shape=(None, None), name="pref_neg_mask_ph"
+        )
+        
+
 
         # Weight for preference regularization (0 disables completely)
         self.pref_loss_weight = tf.placeholder_with_default(0.0, shape=(), name="pref_loss_weight")
+
+        # ===== New: RM-based preference ranking loss (scalar episode scores) =====
+        # self.pref_rm_pos_J_ph = tf.placeholder(tf.float32, (None,), name="pref_rm_pos_J_ph")
+        # self.pref_rm_neg_J_ph = tf.placeholder(tf.float32, (None,), name="pref_rm_neg_J_ph")
+        self.pref_rm_pos_J_ph = tf.placeholder_with_default(
+            tf.zeros((1,), dtype=tf.float32), shape=(None,), name="pref_rm_pos_J_ph"
+        )
+        self.pref_rm_neg_J_ph = tf.placeholder_with_default(
+            tf.zeros((1,), dtype=tf.float32), shape=(None,), name="pref_rm_neg_J_ph"
+        )
+        self.pref_rm_loss_weight = tf.placeholder_with_default(0.0, shape=(), name="pref_rm_loss_weight")
 
         # Build graph
         generator_input = self.flatten(self.generator_obs_ph, self.generator_acs_ph, reuse=False)
@@ -581,53 +622,56 @@ class DiscriminatorCalssifier(object):
             generator_aux_logits, expert_aux_logits = None, None
 
 
-        # ===== Preference-pair loss graph =====
-        pref_loss = tf.constant(0.0)
+        # ===== Preference losses (GATED so placeholders only required when enabled) =====
 
-        def _disc_step_reward(obs_bt, acs_bt):
-            """
-            obs_bt: [B, T, obs_dim]
-            acs_bt: [B, T, act_dim]  (or discrete)
-            returns: [B, T] scalar reward per timestep from discriminator
-            """
-            B = tf.shape(obs_bt)[0]
-            T = tf.shape(obs_bt)[1]
+        def _compute_disc_pref_loss_unweighted():
+            def _disc_step_reward(obs_bt, acs_bt):
+                B = tf.shape(obs_bt)[0]
+                T = tf.shape(obs_bt)[1]
 
-            obs_flat = tf.reshape(obs_bt, (-1,) + self.observation_shape)
+                obs_flat = tf.reshape(obs_bt, (-1,) + self.observation_shape)
 
-            if self.discrete_actions:
-                # acs_bt expected to be int-like; reshape to [-1]
-                acs_flat = tf.reshape(acs_bt, (-1,))
-            else:
-                acs_flat = tf.reshape(acs_bt, (-1,) + self.actions_shape)
+                if self.discrete_actions:
+                    acs_flat = tf.reshape(acs_bt, (-1,))
+                else:
+                    acs_flat = tf.reshape(acs_bt, (-1,) + self.actions_shape)
 
-            flat_inp = self.flatten(obs_flat, acs_flat, reuse=True)  # reuse disc weights
-            out = self.build_GAN_graph(flat_inp, reuse=True)
+                flat_inp = self.flatten(obs_flat, acs_flat, reuse=True)  # reuse disc weights
+                out = self.build_GAN_graph(flat_inp, reuse=True)
+                logits = out[0] if self.dualhead else out
 
-            if self.dualhead:
-                logits = out[0]
-            else:
-                logits = out
+                r = -tf.log(1 - tf.nn.sigmoid(logits) + 1e-8)  # [B*T,1]
+                r = tf.reshape(r, (B, T))                      # [B,T]
+                return r
 
-            # same reward as policy uses: -log(1 - D(s,a))
-            r = -tf.log(1 - tf.nn.sigmoid(logits) + 1e-8)  # shape [B*T, 1]
-            r = tf.reshape(r, (B, T))                      # [B, T]
-            return r
+            r_pos_bt = _disc_step_reward(self.pref_pos_obs_ph, self.pref_pos_acs_ph)  # [B,T]
+            r_neg_bt = _disc_step_reward(self.pref_neg_obs_ph, self.pref_neg_acs_ph)  # [B,T]
 
-        # Compute episodic scores as masked sum of per-step disc rewards
-        r_pos_bt = _disc_step_reward(self.pref_pos_obs_ph, self.pref_pos_acs_ph)  # [B,T]
-        r_neg_bt = _disc_step_reward(self.pref_neg_obs_ph, self.pref_neg_acs_ph)  # [B,T]
+            J_pos = tf.reduce_sum(r_pos_bt * self.pref_pos_mask_ph, axis=1)  # [B]
+            J_neg = tf.reduce_sum(r_neg_bt * self.pref_neg_mask_ph, axis=1)  # [B]
 
-        J_pos = tf.reduce_sum(r_pos_bt * self.pref_pos_mask_ph, axis=1)  # [B]
-        J_neg = tf.reduce_sum(r_neg_bt * self.pref_neg_mask_ph, axis=1)  # [B]
+            pref_pair_loss = tf.nn.softplus(-(J_pos - J_neg))  # [B]
+            return tf.reduce_mean(pref_pair_loss)              # scalar
 
-        # Bradley-Terry / logistic preference loss: want J_pos > J_neg
-        # loss = log(1 + exp(-(J_pos - J_neg)))
-        pref_pair_loss = tf.nn.softplus(-(J_pos - J_neg))  # [B]
-        pref_loss = tf.reduce_mean(pref_pair_loss)
+        def _compute_rm_pref_loss_unweighted():
+            rm_pair_loss = tf.nn.softplus(-(self.pref_rm_pos_J_ph - self.pref_rm_neg_J_ph))  # [B]
+            return tf.reduce_mean(rm_pair_loss)  # scalar
 
-        # apply weight (can be 0)
-        pref_loss = self.pref_loss_weight * pref_loss
+        # Only compute disc-pref loss if pref_loss_weight > 0
+        disc_pref_unweighted = tf.cond(
+            tf.greater(self.pref_loss_weight, 0.0),
+            _compute_disc_pref_loss_unweighted,
+            lambda: tf.constant(0.0, dtype=tf.float32)
+        )
+        pref_loss = self.pref_loss_weight * disc_pref_unweighted
+
+        # Only compute rm-pref loss if pref_rm_loss_weight > 0
+        rm_pref_unweighted = tf.cond(
+            tf.greater(self.pref_rm_loss_weight, 0.0),
+            _compute_rm_pref_loss_unweighted,
+            lambda: tf.constant(0.0, dtype=tf.float32)
+        )
+        pref_rm_loss = self.pref_rm_loss_weight * rm_pref_unweighted
 
         # Build accuracy
         generator_acc = tf.reduce_mean(tf.cast(tf.nn.sigmoid(generator_logits) < 0.5, tf.float32))
@@ -723,9 +767,9 @@ class DiscriminatorCalssifier(object):
         grad_penalty = gradcoeff * grad_pen
 
         # Loss + Accuracy terms
-        self.losses = [generator_loss, expert_loss, entropy, entropy_loss, generator_acc, expert_acc, grad_penalty, aux_loss, pref_loss]
-        self.loss_name = ["generator_loss", "expert_loss", "entropy", "entropy_loss", "generator_acc", "expert_acc", "grad_penalty_loss", "aux_loss", "pref_loss"]
-        self.total_loss = generator_loss + expert_loss + entropy_loss + grad_penalty + aux_loss + pref_loss
+        self.losses = [generator_loss, expert_loss, entropy, entropy_loss, generator_acc, expert_acc, grad_penalty, aux_loss, pref_loss, pref_rm_loss]
+        self.loss_name = ["generator_loss", "expert_loss", "entropy", "entropy_loss", "generator_acc", "expert_acc", "grad_penalty_loss", "aux_loss", "pref_loss", "pref_rm_loss"]
+        self.total_loss = generator_loss + expert_loss + entropy_loss + grad_penalty + aux_loss + pref_loss + pref_rm_loss
 
         #  # ----- L2 weight decay over discriminator parameters -----
         # disc_vars = self.get_trainable_variables()
@@ -780,14 +824,40 @@ class DiscriminatorCalssifier(object):
         #     self.losses + [tf_util.flatgrad(self.total_loss, var_list)]
         # )
 
+    # def flatten(self, obs_ph, acs_ph, reuse=False):
+    #     with tf.variable_scope(self.scope):
+    #         if reuse:
+    #             tf.get_variable_scope().reuse_variables()
+
+    #         if self.normalize:
+    #             with tf.variable_scope("obfilter"):
+    #                 self.obs_rms = RunningMeanStd(shape=self.observation_shape)
+    #             obs = (obs_ph - self.obs_rms.mean) / self.obs_rms.std
+    #         else:
+    #             obs = obs_ph
+
+    #         if self.discrete_actions:
+    #             one_hot_actions = tf.one_hot(acs_ph, self.n_actions)
+    #             actions_ph = tf.cast(one_hot_actions, tf.float32)
+    #         else:
+    #             actions_ph = acs_ph
+
+    #         ob_fl = tf.contrib.layers.flatten(obs)
+    #         act_fl = tf.contrib.layers.flatten(actions_ph)
+    #         flatten_input = tf.concat([ob_fl, act_fl], axis=1)  # concatenate the two input -> form a transition
+    #         return flatten_input
+
     def flatten(self, obs_ph, acs_ph, reuse=False):
         with tf.variable_scope(self.scope):
             if reuse:
                 tf.get_variable_scope().reuse_variables()
 
             if self.normalize:
-                with tf.variable_scope("obfilter"):
-                    self.obs_rms = RunningMeanStd(shape=self.observation_shape)
+                # Create ONCE, never overwrite
+                if self.obs_rms is None:
+                    with tf.variable_scope("obfilter"):
+                        self.obs_rms = RunningMeanStd(shape=self.observation_shape)
+
                 obs = (obs_ph - self.obs_rms.mean) / self.obs_rms.std
             else:
                 obs = obs_ph
@@ -800,8 +870,7 @@ class DiscriminatorCalssifier(object):
 
             ob_fl = tf.contrib.layers.flatten(obs)
             act_fl = tf.contrib.layers.flatten(actions_ph)
-            flatten_input = tf.concat([ob_fl, act_fl], axis=1)  # concatenate the two input -> form a transition
-            return flatten_input
+            return tf.concat([ob_fl, act_fl], axis=1)
 
     def build_GAN_graph(self, inputs, reuse=True):
         """

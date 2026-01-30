@@ -27,7 +27,7 @@ TEACHER_SRC=${REPO_ROOT}/teacher_dataset
 
 # Choose the teacher dataset file you want this run to use:
 # (example: your 3000-episode legacy-exact file)
-FORCE_DATASET="${REPO_ROOT}/stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_300_episodes_8_legacy_exact.npz"
+FORCE_DATASET="${REPO_ROOT}/stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_300_episodes_8_e002_legacy_exact.npz"
 EPISODES=8   # must match the suffix in the filename SAIL builds
 # ----------------------------------------------------------------------
 
