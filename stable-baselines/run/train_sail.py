@@ -802,6 +802,7 @@ type=int)
         config.get('add_pref_to_disc', False)
         or config.get('pref_reweight_teacher', False)
         or config.get('pref_rank_disc', False)
+        or config.get('pref_soft_rank_disc', False)
         or (str(getattr(args, 'pref_pair_filter', 'none')) != 'none')
     )
 

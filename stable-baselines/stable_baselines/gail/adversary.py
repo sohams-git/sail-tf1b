@@ -605,6 +605,14 @@ class DiscriminatorCalssifier(object):
         )
         self.pref_rm_loss_weight = tf.placeholder_with_default(0.0, shape=(), name="pref_rm_loss_weight")
 
+        # ===== Soft-TAC: RM soft targets for pairwise preference =====
+        # target probability that pos is preferred (from reward model)
+        self.pref_soft_target_ph = tf.placeholder_with_default(
+            tf.zeros((1,), dtype=tf.float32), shape=(None,), name="pref_soft_target_ph"
+        )
+        self.pref_soft_weight = tf.placeholder_with_default(0.0, shape=(), name="pref_soft_weight")
+        self.pref_soft_temp = tf.placeholder_with_default(1.0, shape=(), name="pref_soft_temp")
+
         # Build graph
         generator_input = self.flatten(self.generator_obs_ph, self.generator_acs_ph, reuse=False)
         generator_input = tf.stop_gradient(generator_input)
@@ -672,6 +680,54 @@ class DiscriminatorCalssifier(object):
             lambda: tf.constant(0.0, dtype=tf.float32)
         )
         pref_rm_loss = self.pref_rm_loss_weight * rm_pref_unweighted
+
+        # ===== Soft-TAC loss (tanh agreement with RM sign + ties) =====
+        def _compute_soft_tac_loss_unweighted():
+            # reuse the same J_pos/J_neg computed from discriminator rewards
+            def _disc_step_reward(obs_bt, acs_bt):
+                B = tf.shape(obs_bt)[0]
+                T = tf.shape(obs_bt)[1]
+
+                obs_flat = tf.reshape(obs_bt, (-1,) + self.observation_shape)
+                if self.discrete_actions:
+                    acs_flat = tf.reshape(acs_bt, (-1,))
+                else:
+                    acs_flat = tf.reshape(acs_bt, (-1,) + self.actions_shape)
+
+                flat_inp = self.flatten(obs_flat, acs_flat, reuse=True)
+                out = self.build_GAN_graph(flat_inp, reuse=True)
+                logits = out[0] if self.dualhead else out
+
+                r = -tf.log(1 - tf.nn.sigmoid(logits) + 1e-8)   # [B*T,1]
+                r = tf.reshape(r, (B, T))                       # [B,T]
+                return r
+
+            r_pos_bt = _disc_step_reward(self.pref_pos_obs_ph, self.pref_pos_acs_ph)
+            r_neg_bt = _disc_step_reward(self.pref_neg_obs_ph, self.pref_neg_acs_ph)
+
+            J_pos = tf.reduce_sum(r_pos_bt * self.pref_pos_mask_ph, axis=1)  # [B]
+            J_neg = tf.reduce_sum(r_neg_bt * self.pref_neg_mask_ph, axis=1)  # [B]
+
+            # ---- YOUR TANH SOFT-TAC ----
+            # s_i is provided by Python side: sign(J_rm_pos - J_rm_neg) with ties => {-1,0,+1}
+            s = tf.clip_by_value(self.pref_soft_target_ph, -1.0, 1.0)         # [B]
+
+            # alpha = 1/T (your temperature knob)
+            T = tf.maximum(self.pref_soft_temp, 1e-6)
+            p = tf.tanh((J_pos - J_neg) / T)                                  # [B] in [-1,1]
+
+            # sigma_tac = mean_i s_i * p_i
+            sigma_tac = tf.reduce_mean(s * p)
+
+            # L = 1 - sigma_tac
+            return 1.0 - sigma_tac
+
+        soft_tac_unweighted = tf.cond(
+            tf.greater(self.pref_soft_weight, 0.0),
+            _compute_soft_tac_loss_unweighted,
+            lambda: tf.constant(0.0, dtype=tf.float32)
+        )
+        soft_tac_loss = self.pref_soft_weight * soft_tac_unweighted
 
         # Build accuracy
         generator_acc = tf.reduce_mean(tf.cast(tf.nn.sigmoid(generator_logits) < 0.5, tf.float32))
@@ -767,9 +823,9 @@ class DiscriminatorCalssifier(object):
         grad_penalty = gradcoeff * grad_pen
 
         # Loss + Accuracy terms
-        self.losses = [generator_loss, expert_loss, entropy, entropy_loss, generator_acc, expert_acc, grad_penalty, aux_loss, pref_loss, pref_rm_loss]
-        self.loss_name = ["generator_loss", "expert_loss", "entropy", "entropy_loss", "generator_acc", "expert_acc", "grad_penalty_loss", "aux_loss", "pref_loss", "pref_rm_loss"]
-        self.total_loss = generator_loss + expert_loss + entropy_loss + grad_penalty + aux_loss + pref_loss + pref_rm_loss
+        self.losses = [generator_loss, expert_loss, entropy, entropy_loss, generator_acc, expert_acc, grad_penalty, aux_loss, pref_loss, pref_rm_loss, soft_tac_loss]
+        self.loss_name = ["generator_loss", "expert_loss", "entropy", "entropy_loss", "generator_acc", "expert_acc", "grad_penalty_loss", "aux_loss", "pref_loss", "pref_rm_loss", "soft_tac_loss"]
+        self.total_loss = generator_loss + expert_loss + entropy_loss + grad_penalty + aux_loss + pref_loss + pref_rm_loss + soft_tac_loss
 
         #  # ----- L2 weight decay over discriminator parameters -----
         # disc_vars = self.get_trainable_variables()

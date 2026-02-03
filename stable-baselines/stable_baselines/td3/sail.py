@@ -960,17 +960,24 @@ class SAIL(OffPolicyRLModel):
             w_hard = float(self.config.get('pref_rank_weight', 0.0)) if use_hard else 0.0
             Bp = int(self.config.get('pref_rank_batch_size', 32))
 
+            # ADD THESE HERE:
+            w_soft = float(self.config.get("pref_soft_rank_weight", 0.0))
+            w_rm   = float(self.config.get("pref_rm_rank_weight", 0.0))
+
+            need_pairs = (w_hard > 0.0) or (w_soft > 0.0) or (w_rm > 0.0)
+
             # Default: disable both losses for this discriminator iter
             feed_dict.update({
                 self.discriminator.pref_loss_weight: 0.0,     # hard loss weight
                 # self.discriminator.pref_soft_weight: 0.0,     # soft loss weight (NEW) turn this on when using the disc rew for pref loss
                 self.discriminator.pref_rm_loss_weight: 0.0,     # RM-pref loss weight
-                
+                self.discriminator.pref_soft_weight: 0.0,
+                self.discriminator.pref_soft_temp: float(self.config.get("pref_soft_rank_temp", 1.0)),
 
             })
 
             # Run if either hard or soft is requested and actually weighted
-            if (w_hard > 0.0) and (self.pref_teacher_episodes is not None) and (len(self.pref_teacher_episodes) >= 2):
+            if need_pairs and (self.pref_teacher_episodes is not None) and (len(self.pref_teacher_episodes) >= 2):
                 pair = self._sample_filtered_pref_pairs(Bp, step=step)
 
                 if pair is not None:
@@ -988,6 +995,34 @@ class SAIL(OffPolicyRLModel):
                         # NEW: includes tau_stats as last element
                         pos_obs, pos_acs, pos_mask, neg_obs, neg_acs, neg_mask, pos_J, neg_J, tau_stats = pair
 
+                    # ---- RM scalar episode scores (optional RM-only loss) ----
+                    # w_rm = float(self.config.get("pref_rm_rank_weight", 0.0))
+                    if (w_rm > 0.0) and (pos_J is not None) and (neg_J is not None):
+                        feed_dict.update({
+                            self.discriminator.pref_rm_pos_J_ph: pos_J.reshape(-1).astype(np.float32),
+                            self.discriminator.pref_rm_neg_J_ph: neg_J.reshape(-1).astype(np.float32),
+                            self.discriminator.pref_rm_loss_weight: w_rm,
+                        })
+
+                    # ---- Soft-TAC (match disc preference prob to RM preference prob) ----
+                    # w_soft = float(self.config.get("pref_soft_rank_weight", 0.0))
+                    if (w_soft > 0.0) and (pos_J is not None) and (neg_J is not None):
+                        T = float(self.config.get("pref_soft_rank_temp", 1.0))
+                        T = max(T, 1e-6)
+
+                        eps = float(self.config.get("pref_tac_tie_eps", 0.0))  # NEW config knob
+                        diff = (pos_J - neg_J).reshape(-1)  # [B]
+
+                        s = np.zeros_like(diff, dtype=np.float32)
+                        s[diff >  eps] =  1.0
+                        s[diff < -eps] = -1.0
+                        # ties stay 0
+
+                        feed_dict.update({
+                            self.discriminator.pref_soft_target_ph: s.astype(np.float32),   # now s_i in {-1,0,1}
+                            self.discriminator.pref_soft_weight: w_soft,                    # lambda_tac
+                            self.discriminator.pref_soft_temp: T,                           # controls alpha = 1/T
+                        })
 
                     # If your sampler outputs [B,T,1], squeeze to [B,T]
                     if pos_mask.ndim == 3:
@@ -1025,9 +1060,16 @@ class SAIL(OffPolicyRLModel):
 # -------------------------------------------------------------------------------------
 
             if (i == 0) and (step % 5000 == 0):  # occasional debug
-                active = float(feed_dict.get(self.discriminator.pref_loss_weight, 0.0))
+                active_h = float(feed_dict.get(self.discriminator.pref_loss_weight, 0.0))
+                active_s = float(feed_dict.get(self.discriminator.pref_soft_weight, 0.0))
+                active_rm = float(feed_dict.get(self.discriminator.pref_rm_loss_weight, 0.0))
                 n_eps = 0 if self.pref_teacher_episodes is None else len(self.pref_teacher_episodes)
-                print(f"[pref-rank] step={step} active_w={active} n_teacher_eps={n_eps}")
+
+                print(
+                    f"[pref-rank] step={step} "
+                    f"hard_w={active_h} soft_w={active_s} rm_w={active_rm} "
+                    f"n_teacher_eps={n_eps}"
+                )
 
             if tau_stats is not None and (i == 0):
                 print(

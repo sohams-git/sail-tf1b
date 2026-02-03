@@ -79,7 +79,7 @@ PYTHONPATH="$PWD/.." python -u train_sail.py \
   --pref-rank-batch-size 16 \
   \
   --pref-soft-rank-weight 0.5 \
-  --pref-soft-rank-temp 1.0 \
+  --pref-soft-rank-temp 0.5 \
   \
   --pref-pair-filter none \
   --pref-pair-filter-tries 5000 \
