@@ -120,6 +120,17 @@ class SAIL(OffPolicyRLModel):
         self.policy_train_op = None
         self.policy_loss = None
 
+        # ---------------- Qpref (TD3 + preference loss on Q) ----------------
+        self.qpref_pos_obs_ph = None
+        self.qpref_pos_acs_ph = None
+        self.qpref_neg_obs_ph = None
+        self.qpref_neg_acs_ph = None
+
+        self.qpref_weight_ph = None
+        self.qpref_temp_ph = None
+
+        self.qpref_loss = None
+
         ########## customize parallel ###################
         self.n_jobs = n_jobs
 
@@ -255,6 +266,17 @@ class SAIL(OffPolicyRLModel):
                     self.learning_rate_ph = tf.placeholder(tf.float32, [], name="learning_rate_ph")
                     self.d_learning_rate_ph = tf.placeholder(tf.float32, [], name="d_learning_rate_ph")
                     self.bc_learning_rate_ph = tf.placeholder(tf.float32, [], name="bc_learning_rate_ph")
+                    # ---------------- Qpref placeholders ----------------
+                    obs_shape = (None,) + self.observation_space.shape
+                    act_shape = (None,) + self.action_space.shape
+
+                    self.qpref_pos_obs_ph = tf.placeholder(tf.float32, shape=obs_shape, name="qpref_pos_obs")
+                    self.qpref_pos_acs_ph = tf.placeholder(tf.float32, shape=act_shape, name="qpref_pos_acs")
+                    self.qpref_neg_obs_ph = tf.placeholder(tf.float32, shape=obs_shape, name="qpref_neg_obs")
+                    self.qpref_neg_acs_ph = tf.placeholder(tf.float32, shape=act_shape, name="qpref_neg_acs")
+
+                    self.qpref_weight_ph = tf.placeholder(tf.float32, shape=(), name="qpref_weight")
+                    self.qpref_temp_ph   = tf.placeholder(tf.float32, shape=(), name="qpref_temp")
 
 
                 with tf.variable_scope("model", reuse=False):
@@ -265,6 +287,25 @@ class SAIL(OffPolicyRLModel):
                     # Q value when following the current policy
                     qf1_pi, _ = self.policy_tf.make_critics(self.processed_obs_ph,
                                                             policy_out, reuse=True)
+                    
+                    # ------------------- Qpref: critic preference head (NO NEW VARS) -------------------
+                    
+                    if (self.config or {}).get("qpref", False):
+                        # IMPORTANT: must reuse the SAME critic weights created above.
+                        # Do NOT pass `scope=` unless your TD3Policy.make_critics supports it.
+                        q1_pos, q2_pos = self.policy_tf.make_critics(
+                            self.qpref_pos_obs_ph, self.qpref_pos_acs_ph, reuse=True
+                        )
+                        q1_neg, q2_neg = self.policy_tf.make_critics(
+                            self.qpref_neg_obs_ph, self.qpref_neg_acs_ph, reuse=True
+                        )
+
+                        self.qpref_q1_pos, self.qpref_q2_pos = q1_pos, q2_pos
+                        self.qpref_q1_neg, self.qpref_q2_neg = q1_neg, q2_neg
+                    else:
+                        # define attributes anyway so loss block doesn't crash
+                        self.qpref_q1_pos = self.qpref_q2_pos = None
+                        self.qpref_q1_neg = self.qpref_q2_neg = None
 
                 with tf.variable_scope("target", reuse=False):
                     # Create target networks
@@ -322,6 +363,23 @@ class SAIL(OffPolicyRLModel):
 
                     qvalues_losses = qf1_loss + qf2_loss
 
+                    
+                    # ---------------- Qpref loss (critic preference ranking) ----------------
+                    
+                    if (self.config or {}).get("qpref", False):
+                        q1_pos, q2_pos = self.qpref_q1_pos, self.qpref_q2_pos
+                        q1_neg, q2_neg = self.qpref_q1_neg, self.qpref_q2_neg
+
+                        q_pos = tf.minimum(q1_pos, q2_pos)  # [B,1]
+                        q_neg = tf.minimum(q1_neg, q2_neg)  # [B,1]
+
+                        temp = tf.maximum(self.qpref_temp_ph, 1e-6)
+                        delta = (q_pos - q_neg) / temp
+                        self.qpref_loss = tf.reduce_mean(tf.nn.softplus(-delta))   # >= 0
+
+                        qvalues_losses = qvalues_losses + self.qpref_weight_ph * self.qpref_loss
+                    else:
+                        self.qpref_loss = tf.constant(0.0, dtype=tf.float32)
 
                     # Q Values optimizer
                     qvalues_optimizer = tf.train.AdamOptimizer(learning_rate=self.learning_rate_ph)
@@ -345,9 +403,9 @@ class SAIL(OffPolicyRLModel):
 
                     train_values_op = qvalues_optimizer.minimize(qvalues_losses, var_list=qvalues_params)
 
-                    self.infos_names = ['qf1_loss', 'qf2_loss']
+                    self.infos_names = ['qf1_loss', 'qf2_loss','qpref_loss']
                     # All ops to call during one training step
-                    self.step_ops = [qf1_loss, qf2_loss,
+                    self.step_ops = [qf1_loss, qf2_loss, self.qpref_loss,
                                      qf1, qf2, train_values_op]
 
                     # Monitor losses and entropy in tensorboard
@@ -361,6 +419,8 @@ class SAIL(OffPolicyRLModel):
                     i = tf.summary.scalar('qf2_loss', qf2_loss)
                     train_scalar_summaries.append(i)
                     i = tf.summary.scalar('learning_rate', tf.reduce_mean(self.learning_rate_ph))
+                    train_scalar_summaries.append(i)
+                    i = tf.summary.scalar('qpref_loss', self.qpref_loss)
                     train_scalar_summaries.append(i)
 
 
@@ -394,7 +454,7 @@ class SAIL(OffPolicyRLModel):
             batch = self.replay_buffer.sample(self.batch_size)
         return batch
 
-    def _train_step(self, step, writer, learning_rate, update_policy):
+    def _train_step(self, step, writer, learning_rate, update_policy, grad_step=None):
         batch = self.generate_train_data(step, mode=self.config['shaping_mode'])
 
         batch_obs, batch_actions, batch_rewards, batch_next_obs, batch_dones, batch_if_demos, batch_returns, batch_true_rewards = batch[:8]
@@ -420,6 +480,48 @@ class SAIL(OffPolicyRLModel):
             self.learning_rate_ph: learning_rate
         }
 
+        # ---------------- Qpref config ----------------
+        cfg = self.config or {}
+        qpref_w     = float(cfg.get("qpref_weight", 0.0))
+        qpref_T     = float(cfg.get("qpref_temp", 1.0))
+        qpref_B     = int(cfg.get("qpref_batch_size", 32))
+        qpref_start = int(cfg.get("qpref_start_step", 0))
+
+        # ---------------- Qpref feed: ALWAYS feed placeholders (prevents TF "must feed" errors) ----------------
+        obs_dim = self.observation_space.shape[0]
+        act_dim = self.action_space.shape[0]
+
+        feed_dict[self.qpref_pos_obs_ph] = np.zeros((1, obs_dim), dtype=np.float32)
+        feed_dict[self.qpref_pos_acs_ph] = np.zeros((1, act_dim), dtype=np.float32)
+        feed_dict[self.qpref_neg_obs_ph] = np.zeros((1, obs_dim), dtype=np.float32)
+        feed_dict[self.qpref_neg_acs_ph] = np.zeros((1, act_dim), dtype=np.float32)
+
+        # default: qpref OFF
+        feed_dict[self.qpref_weight_ph] = 0.0
+        feed_dict[self.qpref_temp_ph]   = max(qpref_T, 1e-6)
+
+        # enable qpref only when we actually have valid pairs
+        if (qpref_w > 0.0) and (step >= qpref_start):
+            pair = self._sample_qpref_start_pairs(qpref_B)
+            if pair is not None:
+                pos_obs, pos_acs, neg_obs, neg_acs = pair
+                feed_dict.update({
+                    self.qpref_pos_obs_ph: pos_obs,
+                    self.qpref_pos_acs_ph: pos_acs,
+                    self.qpref_neg_obs_ph: neg_obs,
+                    self.qpref_neg_acs_ph: neg_acs,
+                    self.qpref_weight_ph: qpref_w,
+                    self.qpref_temp_ph: max(qpref_T, 1e-6),
+                })
+        # ✅ PUT THE DEBUG PRINT RIGHT HERE (after sampling + feed update)
+        if (grad_step == 0) and (step % 5000 == 0):
+            n_eps = 0 if self.pref_teacher_episodes is None else len(self.pref_teacher_episodes)
+            print(
+                f"[QPREF] step={step} qpref={cfg.get('qpref', False)} "
+                f"qpref_w={qpref_w} fed_w={feed_dict[self.qpref_weight_ph]} "
+                f"n_teacher_eps={n_eps} pair_none={pair is None if (qpref_w>0 and step>=qpref_start) else 'NA'}"
+            )
+
         step_ops = self.step_ops
         if update_policy:
             # Update policy and target networks
@@ -435,10 +537,10 @@ class SAIL(OffPolicyRLModel):
             out = self.sess.run(step_ops, feed_dict)
 
         # Unpack to monitor losses
-        qf1_loss, qf2_loss, *_values = out
+        qf1_loss, qf2_loss, qpref_loss, *_values = out
 
         del batch
-        return qf1_loss, qf2_loss
+        return qf1_loss, qf2_loss, qpref_loss
 
     def shift_actions(self, ac_expert):
         # add noise to expert actions if needed when explore_expert is True
@@ -468,6 +570,7 @@ class SAIL(OffPolicyRLModel):
         need_rm = (
             cfg.get('pref_reweight_teacher', False)
             or cfg.get('pref_rank_disc', False)
+            or cfg.get('qpref', False) 
             or (pair_filter != 'none')
         )
         if not need_rm:
@@ -519,7 +622,7 @@ class SAIL(OffPolicyRLModel):
         J_phi(τ) = sum_t R_phi(s_t, a_t) for each episode, then
         compute Boltzmann weights over episodes.
         """
-        if not (self.config.get('pref_reweight_teacher', False) or self.config.get('pref_rank_disc', False)):
+        if not (self.config.get('pref_reweight_teacher', False) or self.config.get('pref_rank_disc', False) or self.config.get('qpref', False)):
             return
 
         rm = self._ensure_pref_teacher_rm()
@@ -673,6 +776,51 @@ class SAIL(OffPolicyRLModel):
         neg_J = np.array([float(ep.get('J', 0.0)) for ep in neg_eps], dtype=np.float32).reshape(-1, 1)
 
         return pos_obs, pos_acs, pos_mask, neg_obs, neg_acs, neg_mask, pos_J, neg_J
+    
+    def _sample_qpref_start_pairs(self, B):
+        """
+        Sample B preference-labeled start (s0,a0) pairs using stored J in pref_teacher_episodes.
+
+        Returns:
+          pos_obs: [B, obs_dim]
+          pos_acs: [B, act_dim]
+          neg_obs: [B, obs_dim]
+          neg_acs: [B, act_dim]
+        """
+        if (self.pref_teacher_episodes is None) or (len(self.pref_teacher_episodes) < 2):
+            return None
+
+        eps = self.pref_teacher_episodes
+        N = len(eps)
+
+        idx_a = np.random.randint(0, N, size=B)
+        idx_b = np.random.randint(0, N, size=B)
+        for k in range(B):
+            if idx_b[k] == idx_a[k]:
+                idx_b[k] = (idx_b[k] + 1) % N
+
+        pos_obs, pos_acs, neg_obs, neg_acs = [], [], [], []
+        for a, b in zip(idx_a, idx_b):
+            Ja = float(eps[a].get('J', 0.0))
+            Jb = float(eps[b].get('J', 0.0))
+
+            if Ja >= Jb:
+                epP, epN = eps[a], eps[b]
+            else:
+                epP, epN = eps[b], eps[a]
+
+            tP = np.random.randint(0, epP['acs'].shape[0])
+            tN = np.random.randint(0, epN['acs'].shape[0])
+
+            pos_obs.append(epP['obs'][tP])
+            pos_acs.append(epP['acs'][tP])
+            neg_obs.append(epN['obs'][tN])
+            neg_acs.append(epN['acs'][tN])
+
+        return (np.asarray(pos_obs, dtype=np.float32),
+                np.asarray(pos_acs, dtype=np.float32),
+                np.asarray(neg_obs, dtype=np.float32),
+                np.asarray(neg_acs, dtype=np.float32))    
 
     #-----------
     def _disc_episode_score(self, obs_ep, acs_ep):
@@ -1300,7 +1448,7 @@ class SAIL(OffPolicyRLModel):
                             # -------------------------
                             # 2) ALSO add to pref teacher episode buffer (PR-SAIL only)
                             # -------------------------
-                            if self.config.get('pref_reweight_teacher', False) or self.config.get('pref_rank_disc', False):
+                            if (self.config.get('pref_reweight_teacher', False) or self.config.get('pref_rank_disc', False) or self.config.get('qpref', False)):
                                 rm = self._ensure_pref_teacher_rm()
                                 if rm is not None:
                                     try:
@@ -1370,7 +1518,7 @@ class SAIL(OffPolicyRLModel):
                         # Note: the policy is updated less frequently than the Q functions
                         # this is controlled by the `policy_delay` parameter
                         mb_infos_vals.append(
-                            self._train_step(step, writer, current_lr, (step + grad_step) % self.policy_delay == 0))
+                            self._train_step(step, writer, current_lr, (step + grad_step) % self.policy_delay == 0, grad_step=grad_step))
 
                     # Log losses and entropy, useful for monitor training
                     if len(mb_infos_vals) > 0:

@@ -554,6 +554,40 @@ if __name__ == '__main__':
     
 
     # ============================================================
+    # Qpref: TD3 + Q-preference loss on critic
+    # ============================================================
+    parser.add_argument(
+        "--qpref",
+        action="store_true",
+        help="Enable TD3 + Q-preference loss (Qpref) in SAIL's critic update."
+    )
+    parser.add_argument(
+        "--qpref-weight",
+        type=float,
+        default=0.0,
+        help="Lambda for Qpref loss. 0 disables even if --qpref is set."
+    )
+    parser.add_argument(
+        "--qpref-temp",
+        type=float,
+        default=1.0,
+        help="Temperature T for Qpref logistic loss: -log(sigmoid((Q+ - Q-)/T))."
+    )
+    parser.add_argument(
+        "--qpref-batch-size",
+        type=int,
+        default=32,
+        help="Number of preference pairs sampled per TD3 critic update."
+    )
+    parser.add_argument(
+        "--qpref-start-step",
+        type=int,
+        default=0,
+        help="Start applying Qpref after this env step (0 = immediately)."
+    )
+    
+
+    # ============================================================
     # EXPERIMENT: preference-pair filtering for DISC ranking loss
     # (default OFF; does not affect other runs unless enabled)
     # ============================================================
@@ -795,6 +829,21 @@ type=int)
     config['pref_soft_rank_weight'] = float(args.pref_soft_rank_weight)
     config['pref_soft_rank_temp'] = float(args.pref_soft_rank_temp)
 
+    # ===========================
+    # Qpref config for SAIL.td3.sail.py
+    # ===========================
+    config['qpref'] = bool(getattr(args, 'qpref', False))
+
+    # If user sets --qpref but forgets weight, default to a sane small value
+    qpref_w = float(getattr(args, 'qpref_weight', 0.0))
+    if config['qpref'] and qpref_w <= 0.0:
+        qpref_w = 0.1
+
+    config['qpref_weight'] = qpref_w
+    config['qpref_temp'] = float(getattr(args, 'qpref_temp', 1.0))
+    config['qpref_batch_size'] = int(getattr(args, 'qpref_batch_size', 32))
+    config['qpref_start_step'] = int(getattr(args, 'qpref_start_step', 0))
+
     # Common pref-RM config fields (used by add-pref-to-disc AND pref-reweight-teacher)
     # We only expect SAIL code to actually *use* them when the corresponding flags are True.
     # Common pref-RM config fields (used by add-pref-to-disc AND pref-reweight-teacher AND rank/filter)
@@ -802,6 +851,7 @@ type=int)
         config.get('add_pref_to_disc', False)
         or config.get('pref_reweight_teacher', False)
         or config.get('pref_rank_disc', False)
+        or config.get('qpref', False)
         or (str(getattr(args, 'pref_pair_filter', 'none')) != 'none')
     )
 
