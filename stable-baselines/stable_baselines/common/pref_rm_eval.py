@@ -1,5 +1,6 @@
 import os, glob
 import numpy as np, torch
+import torch.nn as nn
 
 class _NPZPrefRewardModel:
     def __init__(self, path, device="cpu", expect_obs_dim=18, norm="zscore"):
@@ -101,15 +102,108 @@ class _BPrefTorchScriptReward:
         r = torch.stack(outs, dim=0).mean(0)
         return r.cpu().numpy()
 
+class _BPrefStateDictReward:
+    """
+    Supports plain PyTorch state_dict checkpoints saved as OrderedDict
+    with keys like: 0.weight, 0.bias, 2.weight, ...
+    Assumes input is concat([obs, act]) and output is scalar reward.
+    """
+    def __init__(self, path, device="cpu", expect_obs_dim=17):
+        self.device = torch.device(device)
+        sd = torch.load(path, map_location="cpu")
+        if not isinstance(sd, (dict,)):
+            raise TypeError(f"Expected state_dict dict/OrderedDict, got {type(sd)}")
+
+        self.sd = sd
+        self.expect_obs_dim = expect_obs_dim  # can be -1 (auto) or fixed
+        self.net = None
+        self.rm_in_dim = int(sd["0.weight"].shape[1])  # total input dim (obs+act)
+
+    def _build_net(self):
+        sd = self.sd
+        w0 = sd["0.weight"].shape
+        w2 = sd["2.weight"].shape
+        w4 = sd["4.weight"].shape
+        w6 = sd["6.weight"].shape
+
+        h1 = w0[0]; h2 = w2[0]; h3 = w4[0]; out = w6[0]
+        assert out == 1, f"Expected scalar reward output, got out_dim={out}"
+
+        net = nn.Sequential(
+            nn.Linear(self.rm_in_dim, h1),
+            nn.ReLU(),
+            nn.Linear(h1, h2),
+            nn.ReLU(),
+            nn.Linear(h2, h3),
+            nn.ReLU(),
+            nn.Linear(h3, 1),
+        )
+        net.load_state_dict(sd, strict=True)
+        net.to(self.device)
+        net.eval()
+        self.net = net
+
+    @torch.no_grad()
+    def reward(self, obs_np, action_np=None, next_obs_np=None):
+        if action_np is None:
+            raise ValueError("StateDict RM expects action_np (input is [obs, act]).")
+
+        obs = torch.tensor(obs_np, dtype=torch.float32, device=self.device)
+        act = torch.tensor(action_np, dtype=torch.float32, device=self.device)
+
+        act_dim = int(act.shape[1])
+        expected_obs_dim = self.rm_in_dim - act_dim
+        if expected_obs_dim <= 0:
+            raise ValueError(f"Bad expected_obs_dim={expected_obs_dim} from rm_in_dim={self.rm_in_dim}, act_dim={act_dim}")
+
+        # If user hardcoded expect_obs_dim, respect it (for HC backwards compat)
+        # Otherwise auto-slice to what RM actually needs
+        if self.expect_obs_dim is None or int(self.expect_obs_dim) <= 0:
+            use_obs_dim = expected_obs_dim
+        else:
+            use_obs_dim = int(self.expect_obs_dim)
+
+        if obs.shape[1] != use_obs_dim:
+            obs = obs[:, :use_obs_dim]
+
+        x = torch.cat([obs, act], dim=1)
+
+        # RM expects rm_in_dim exactly; ensure x matches
+        if x.shape[1] != self.rm_in_dim:
+            # last-resort trim/pad (shouldn’t happen if slicing is right)
+            if x.shape[1] > self.rm_in_dim:
+                x = x[:, :self.rm_in_dim]
+            else:
+                pad = torch.zeros((x.shape[0], self.rm_in_dim - x.shape[1]), device=self.device)
+                x = torch.cat([x, pad], dim=1)
+
+        if self.net is None:
+            self._build_net()
+
+        r = self.net(x).squeeze(-1)
+        return r.cpu().numpy()
+
 class PrefRewardModel:
     """Factory wrapper. Use .reward(obs, act=None, next_obs=None) -> np.ndarray"""
     def __init__(self, path, device="cpu", expect_obs_dim=17, norm="none"):
-        if (os.path.isdir(path) or path.endswith(".pt")):
+        if os.path.isdir(path):
+            # directory => TorchScript ensemble directory (unchanged behavior)
             self.impl = _BPrefTorchScriptReward(path, device=device, expect_obs_dim=expect_obs_dim)
+
+        elif path.endswith(".pt"):
+            # could be TorchScript OR state_dict
+            try:
+                self.impl = _BPrefTorchScriptReward(path, device=device, expect_obs_dim=expect_obs_dim)
+            except Exception as e:
+                # fallback to state_dict (Hopper case)
+                self.impl = _BPrefStateDictReward(path, device=device, expect_obs_dim=expect_obs_dim)
+
         elif path.endswith(".npz"):
             self.impl = _NPZPrefRewardModel(path, device=device, expect_obs_dim=expect_obs_dim, norm=norm)
+
         else:
             raise ValueError(f"Unrecognized reward model path: {path}")
+
 
     def reward(self, obs_np, action_np=None, next_obs_np=None):
         return self.impl.reward(obs_np, action_np, next_obs_np)

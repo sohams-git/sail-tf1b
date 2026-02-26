@@ -6,8 +6,9 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=8G
 #SBATCH --time=24:00:00
-#SBATCH --output=/nfs/turbo/umd-sabymath/Soham/sail-tf1b/stable-baselines/run/logs/slurm_tac_%j.out
-#SBATCH --error=/nfs/turbo/umd-sabymath/Soham/sail-tf1b/stable-baselines/run/logs/slurm_tac_%j.err
+#SBATCH --array=0 
+#SBATCH --output=/nfs/turbo/umd-sabymath/Soham/sail-tf1b/stable-baselines/run/logs/slurm_tac_%A_%a.out
+#SBATCH --error=/nfs/turbo/umd-sabymath/Soham/sail-tf1b/stable-baselines/run/logs/slurm_tac_%A_%a.err
 #SBATCH --account=sabymath0
 
 set -euo pipefail
@@ -22,9 +23,10 @@ RUN_DIR=${REPO_ROOT}/stable-baselines/run
 VENV=$HOME/.venvs/sail-tf1b
 
 ENV_ID=HalfCheetah-v2
-STEPS=500000
+STEPS=1000000
 EPISODES=4
-SEED=1
+SEEDS=(6)
+SEED=${SEEDS[$SLURM_ARRAY_TASK_ID]}
 
 # Offline preference RM (BPref export)
 PREF_RM=/nfs/turbo/umd-sridas/Soham/BPref/runs/halfcheetah/pebble_oracle_b500_seg50_disa_s0/exports/reward_model_ts.pt
@@ -58,7 +60,7 @@ ln -sfn "${ORIG_DATASET}" "${TARGET_LINK}"
 cd "${RUN_DIR}"
 
 # ---------------- Run name ----------------
-RUN_NAME="SAIL_TAC_softpref_${STEPS}_s${SEED}"
+RUN_NAME="SAIL_softTAC_${STEPS}_s${SEED}"
 
 export WANDB_PROJECT="SAIL_variants"
 export WANDB_NAME="${RUN_NAME}"
@@ -76,7 +78,7 @@ PYTHONPATH="$PWD/.." python -u train_sail.py \
   --pref-reweight-teacher \
   --pref-rank-disc \
   --pref-rank-weight 0.0 \
-  --pref-rank-batch-size 16 \
+  --pref-rank-batch-size 32 \
   \
   --pref-soft-rank-weight 0.5 \
   --pref-soft-rank-temp 1.0 \

@@ -175,6 +175,11 @@ class SAIL(OffPolicyRLModel):
         self.pref_teacher_weights = None    # np.array [N_traj], softmax over scores
         self._pref_teacher_rm = None        # offline BPref reward model for teacher reweighting
 
+        # Preference-based STUDENT episode buffer (student-only QPref variant)
+        self.pref_student_episodes = None   # list of dicts: {'obs': [T, d_o], 'acs': [T, d_a], 'J': float}
+        self.pref_student_scores = None     # np.array [N_traj]
+        self.pref_student_weights = None    # np.array [N_traj]
+
 
         self.d_batch_size = self.batch_size
         # self.d_batch_size = 5000
@@ -501,9 +506,15 @@ class SAIL(OffPolicyRLModel):
         feed_dict[self.qpref_temp_ph]   = max(qpref_T, 1e-6)
 
         # enable qpref only when we actually have valid pairs
+        pair = None
+        pair_none_dbg = True
+
         if (qpref_w > 0.0) and (step >= qpref_start):
-            pair = self._sample_qpref_start_pairs(qpref_B)
+            qpref_source = str(cfg.get("qpref_source", "teacher"))
+            pair = self._sample_qpref_start_pairs(qpref_B, source=qpref_source)
+
             if pair is not None:
+                pair_none_dbg = False
                 pos_obs, pos_acs, neg_obs, neg_acs = pair
                 feed_dict.update({
                     self.qpref_pos_obs_ph: pos_obs,
@@ -513,13 +524,15 @@ class SAIL(OffPolicyRLModel):
                     self.qpref_weight_ph: qpref_w,
                     self.qpref_temp_ph: max(qpref_T, 1e-6),
                 })
-        # ✅ PUT THE DEBUG PRINT RIGHT HERE (after sampling + feed update)
+
+        # ✅ debug print (now safe)
         if (grad_step == 0) and (step % 5000 == 0):
-            n_eps = 0 if self.pref_teacher_episodes is None else len(self.pref_teacher_episodes)
+            n_teacher = 0 if self.pref_teacher_episodes is None else len(self.pref_teacher_episodes)
+            n_student = 0 if self.pref_student_episodes is None else len(self.pref_student_episodes)
             print(
                 f"[QPREF] step={step} qpref={cfg.get('qpref', False)} "
-                f"qpref_w={qpref_w} fed_w={feed_dict[self.qpref_weight_ph]} "
-                f"n_teacher_eps={n_eps} pair_none={pair is None if (qpref_w>0 and step>=qpref_start) else 'NA'}"
+                f"src={cfg.get('qpref_source','teacher')} qpref_w={qpref_w} fed_w={feed_dict[self.qpref_weight_ph]} "
+                f"n_teacher_eps={n_teacher} n_student_eps={n_student} pair_none={pair_none_dbg}"
             )
 
         step_ops = self.step_ops
@@ -660,6 +673,56 @@ class SAIL(OffPolicyRLModel):
         self._recompute_pref_teacher_weights()
         print("[SAIL:pref-reweight] Built initial teacher buffer with",
               len(self.pref_teacher_episodes), "episodes.")
+        
+    def _recompute_pref_student_weights(self):
+            if not self.pref_student_episodes:
+                self.pref_student_scores = None
+                self.pref_student_weights = None
+                return
+
+            scores = np.array([ep['J'] for ep in self.pref_student_episodes], dtype=np.float64)
+            beta = float(self.config.get('pref_beta', 1.0))
+            s = scores / beta
+            s = s - s.max()
+            w = np.exp(s)
+            w = w / (w.sum() + 1e-8)
+
+            self.pref_student_scores = scores
+            self.pref_student_weights = w    
+
+    def _add_student_episode_to_pref_buffer(self, obs_ep, acs_ep):
+            """
+            Store a completed STUDENT episode into pref_student_episodes using pref RM score J.
+            """
+            if not self.config.get('qpref', False):
+                return
+            if str(self.config.get('qpref_source', 'teacher')) != 'student':
+                return
+
+            rm = self._ensure_pref_teacher_rm()   # reuse same loader; it's just "the pref RM"
+            if rm is None:
+                return
+
+            try:
+                r_pref = rm.reward(obs_ep, acs_ep)
+                r_pref = np.asarray(r_pref).reshape(-1)
+                J = float(r_pref.sum())
+            except Exception as e:
+                print("[SAIL:student-qpref] ERROR computing J_phi for student episode:", e)
+                J = 0.0
+
+            if self.pref_student_episodes is None:
+                self.pref_student_episodes = []
+
+            self.pref_student_episodes.append({'obs': obs_ep.copy(), 'acs': acs_ep.copy(), 'J': J})
+
+            # prune to max size
+            max_traj = int(self.config.get('pref_max_student_trajs', 500))
+            if len(self.pref_student_episodes) > max_traj:
+                # keep most recent max_traj (simple + stable)
+                self.pref_student_episodes = self.pref_student_episodes[-max_traj:]
+
+            self._recompute_pref_student_weights()    
 
     def _sample_pref_weighted_expert(self):
         """
@@ -777,22 +840,23 @@ class SAIL(OffPolicyRLModel):
 
         return pos_obs, pos_acs, pos_mask, neg_obs, neg_acs, neg_mask, pos_J, neg_J
     
-    def _sample_qpref_start_pairs(self, B):
+    def _sample_qpref_start_pairs(self, B, source="teacher"):
         """
-        Sample B preference-labeled start (s0,a0) pairs using stored J in pref_teacher_episodes.
+        Sample B preference-labeled (s,a) pairs using stored J.
 
-        Returns:
-          pos_obs: [B, obs_dim]
-          pos_acs: [B, act_dim]
-          neg_obs: [B, obs_dim]
-          neg_acs: [B, act_dim]
+        source:
+          - "teacher": uses pref_teacher_episodes (current behavior)
+          - "student": uses pref_student_episodes (new variant)
         """
-        if (self.pref_teacher_episodes is None) or (len(self.pref_teacher_episodes) < 2):
+        if source == "student":
+            eps = self.pref_student_episodes
+        else:
+            eps = self.pref_teacher_episodes
+
+        if (eps is None) or (len(eps) < 2):
             return None
 
-        eps = self.pref_teacher_episodes
         N = len(eps)
-
         idx_a = np.random.randint(0, N, size=B)
         idx_b = np.random.randint(0, N, size=B)
         for k in range(B):
@@ -820,7 +884,7 @@ class SAIL(OffPolicyRLModel):
         return (np.asarray(pos_obs, dtype=np.float32),
                 np.asarray(pos_acs, dtype=np.float32),
                 np.asarray(neg_obs, dtype=np.float32),
-                np.asarray(neg_acs, dtype=np.float32))    
+                np.asarray(neg_acs, dtype=np.float32))
 
     #-----------
     def _disc_episode_score(self, obs_ep, acs_ep):
@@ -1486,6 +1550,28 @@ class SAIL(OffPolicyRLModel):
 
                     ## record most 10 expert episodic scores in to log file
                     #avg_expert_score = np.mean(self.expert_scores)
+                    # self.episode_buffer.reset()
+                    # -------------------------
+                    # STUDENT-QPREF: store this just-finished episode into pref_student_episodes
+                    # -------------------------
+                    if self.config.get('qpref', False) and str(self.config.get('qpref_source', 'teacher')) == 'student':
+                        obs_ep = []
+                        acs_ep = []
+
+                        # Use the same iterator you already use above (keeps ordering consistent)
+                        for transition in self.episode_buffer.get_episode_return(es):
+                            s, a, r, s1, if_done, _, _, true_r, discount_return = transition
+                            obs_ep.append(s)
+                            acs_ep.append(a)
+
+                        if len(obs_ep) > 1:
+                            obs_ep = np.asarray(obs_ep, dtype=np.float32)
+                            acs_ep = np.asarray(acs_ep, dtype=np.float32)
+
+                            # this helper computes J using pref RM and appends/prunes/reweights
+                            self._add_student_episode_to_pref_buffer(obs_ep, acs_ep)
+
+                    # IMPORTANT: keep this after we stored the episode
                     self.episode_buffer.reset()
                 obs = new_obs
 
@@ -1829,6 +1915,12 @@ class SAIL(OffPolicyRLModel):
                     r_pref = self._pref_add_rm.reward(observation, action)
 
                     r_pref = np.asarray(r_pref).reshape(-1)  # shape (N,)
+                    if not hasattr(self, "_pref_debug_once"):
+                        self._pref_debug_once = True
+                        print("[DEBUG] r_gail stats:",
+                            float(np.min(r_gail)), float(np.mean(r_gail)), float(np.max(r_gail)))
+                        print("[DEBUG] r_pref stats:",
+                            float(np.min(r_pref)), float(np.mean(r_pref)), float(np.max(r_pref)))
 
     
 

@@ -35,7 +35,7 @@ PREF_RM=/nfs/turbo/umd-sridas/Soham/BPref/runs/halfcheetah/pebble_oracle_b500_se
 
 ENV_ID=HalfCheetah-v2
 STEPS=1000000             # change for shorter/longer training
-SEEDS=(3)            # 3 runs = 3 array indices
+SEEDS=(10)            # 3 runs = 3 array indices
 # ----------------------------------------------------------------------
 
 SID=$SLURM_ARRAY_TASK_ID
@@ -95,7 +95,7 @@ COMMON_ARGS=(
   --n-episodes "${EPISODES}"
 )
 
-RUN_NAME="weighteddiscSAIL1500ep_${STEPS}_s${SEED}"
+RUN_NAME="PAIL_${STEPS}_s${SEED}"
 
 # ---- W&B naming from sbatch (Option B) ----
 export WANDB_PROJECT="SAIL_variants"

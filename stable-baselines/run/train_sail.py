@@ -585,6 +585,24 @@ if __name__ == '__main__':
         default=0,
         help="Start applying Qpref after this env step (0 = immediately)."
     )
+
+    # ============================================================
+    # Qpref SOURCE: teacher vs student
+    # ============================================================
+    parser.add_argument(
+        "--qpref-source",
+        type=str,
+        default="teacher",
+        choices=["teacher", "student"],
+        help="Where Qpref pairs come from. 'teacher' uses pref_teacher_episodes. "
+             "'student' uses pref_student_episodes built from student rollouts."
+    )
+    parser.add_argument(
+        "--pref-max-student-trajs",
+        type=int,
+        default=500,
+        help="Max number of STUDENT episodes stored for student-Qpref (pref_student_episodes)."
+    )
     
 
     # ============================================================
@@ -752,9 +770,16 @@ type=int)
         os.environ.setdefault("WANDB_SILENT", "true")
 
         run_name = f"{args.task}_{args.algo}_{args.env}_seed{args.seed}"
+        wandb_project = os.getenv("WANDB_PROJECT", "SAIL_variants")
+        wandb_name    = os.getenv("WANDB_NAME", None)
+        wandb_group   = os.getenv("WANDB_GROUP", None)
+        wandb_entity  = os.getenv("WANDB_ENTITY", None)
+
         wandb_run = wandb.init(
-            project="SAIL_variants",    # <- rename if you want
-            # name=run_name,
+            project=wandb_project,
+            name=wandb_name,
+            group=wandb_group,
+            entity=wandb_entity,
             config=vars(args),
             reinit=True
         )
@@ -844,6 +869,10 @@ type=int)
     config['qpref_batch_size'] = int(getattr(args, 'qpref_batch_size', 32))
     config['qpref_start_step'] = int(getattr(args, 'qpref_start_step', 0))
 
+    # NEW (student-only variant switch)
+    config['qpref_source'] = str(getattr(args, 'qpref_source', 'teacher'))
+    config['pref_max_student_trajs'] = int(getattr(args, 'pref_max_student_trajs', 500))
+
     # Common pref-RM config fields (used by add-pref-to-disc AND pref-reweight-teacher)
     # We only expect SAIL code to actually *use* them when the corresponding flags are True.
     # Common pref-RM config fields (used by add-pref-to-disc AND pref-reweight-teacher AND rank/filter)
@@ -880,6 +909,18 @@ type=int)
     # Push SAIL config into W&B config (rank 0 only)
     if rank == 0 and wandb_run is not None:
         wandb_run.config.update(config, allow_val_change=True)
+
+    # ---- DEBUG: confirm QPREF wiring ----
+    if rank == 0:
+        print(
+            "[QPREF] enabled=", config.get('qpref', False),
+            "source=", config.get('qpref_source', 'teacher'),
+            "w=", config.get('qpref_weight', None),
+            "T=", config.get('qpref_temp', None),
+            "B=", config.get('qpref_batch_size', None),
+            "start=", config.get('qpref_start_step', None),
+        )
+        print("[QPREF] pref_rm_path=", config.get('pref_rm_path', None))
 
     #args.log_dir = args.log_dir.replace('eval-bc', 'eval-bc-episode-{}'.format(config['n_episodes']))  
     os.makedirs(args.log_dir, exist_ok=True)

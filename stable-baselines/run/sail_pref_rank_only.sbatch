@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=8G
 #SBATCH --time=24:00:00
-#SBATCH --array=0
+#SBATCH --array=0-3
 #SBATCH --output=/nfs/turbo/umd-sabymath/Soham/sail-tf1b/stable-baselines/run/logs/slurm_pref_rank_only_%A_%a.out
 #SBATCH --error=/nfs/turbo/umd-sabymath/Soham/sail-tf1b/stable-baselines/run/logs/slurm_pref_rank_only_%A_%a.err
 #SBATCH --account=sabymath0
@@ -24,7 +24,7 @@ VENV=$HOME/.venvs/sail-tf1b
 ENV_ID=HalfCheetah-v2
 STEPS=1000000
 EPISODES=4
-SEEDS=(1)
+SEEDS=(2 3 4 5)
 SID=$SLURM_ARRAY_TASK_ID
 SEED=${SEEDS[$SID]}
 
@@ -42,7 +42,7 @@ source "${VENV}/bin/activate"
 mkdir -p "${RUN_DIR}/logs" "${RUN_DIR}/tb_logs"
 cd "${RUN_DIR}"
 
-RUN_NAME="SAIL_rank_only_${STEPS}_s${SEED}"
+RUN_NAME="SAIL_Preference_Ranking_${STEPS}_s${SEED}"
 
 export WANDB_PROJECT="SAIL_variants"
 export WANDB_NAME="${RUN_NAME}"

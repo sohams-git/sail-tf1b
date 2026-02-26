@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=8G
 #SBATCH --time=24:00:00
-#SBATCH --array=0-1                          # 3 variants = 3 tasks
+#SBATCH --array=0                          # 3 variants = 3 tasks
 #SBATCH --output=/nfs/turbo/umd-sabymath/Soham/sail-tf1b/stable-baselines/run/logs/slurm_%A_%a.out
 #SBATCH --error=/nfs/turbo/umd-sabymath/Soham/sail-tf1b/stable-baselines/run/logs/slurm_%A_%a.err
 #SBATCH --account=sabymath0
@@ -27,8 +27,8 @@ TEACHER_SRC=${REPO_ROOT}/teacher_dataset
 
 # Choose the teacher dataset file you want this run to use:
 # (example: your 3000-episode legacy-exact file)
-FORCE_DATASET="${REPO_ROOT}/stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_300_episodes_8_e002_legacy_exact.npz"
-EPISODES=8   # must match the suffix in the filename SAIL builds
+FORCE_DATASET="${REPO_ROOT}/stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_500_episodes_4_legacy_exact.npz"
+EPISODES=4   # must match the suffix in the filename SAIL builds
 # ----------------------------------------------------------------------
 
 # (Only used for non-vanilla variants)
@@ -36,10 +36,10 @@ PREF_RM=/nfs/turbo/umd-sridas/Soham/BPref/runs/halfcheetah/pebble_oracle_b500_se
 
 ENV_ID=HalfCheetah-v2
 STEPS=1000000      # quick run; increase for full training
-SEEDS=(10 11)
+SEEDS=(5)
 # VARIANTS=(vanilla critic adddisc)
 # VARIANTS=(adddisc)
-VARIANTS=(vanilla)
+VARIANTS=(adddisc)
 
 VID=$(( SLURM_ARRAY_TASK_ID % ${#VARIANTS[@]} ))
 SID=$(( SLURM_ARRAY_TASK_ID / ${#VARIANTS[@]} ))
@@ -109,7 +109,7 @@ case "${VAR}" in
     ;;
 
   adddisc)
-    RUN_NAME="discsail1500_${STEPS}_s${SEED}"
+    RUN_NAME="discsail500_${STEPS}_s${SEED}"
     EXTRA_ARGS=( --add-pref-to-disc --pref-rm "${PREF_RM}" --pref-expect-obs-dim 17 --pref-weight 1.0 --pref-norm zscore --pref-clip 5.0 )
     ;;
 
