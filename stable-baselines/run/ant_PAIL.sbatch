@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 #SBATCH --time=24:00:00
-#SBATCH --array=0-2
+#SBATCH --array=0-3
 #SBATCH --output=/nfs/turbo/umd-sabymath/Soham/sail-tf1b/stable-baselines/run/logs/slurm_prefrew_ant_%A_%a.out
 #SBATCH --error=/nfs/turbo/umd-sabymath/Soham/sail-tf1b/stable-baselines/run/logs/slurm_prefrew_ant_%A_%a.err
 #SBATCH --account=sabymath0
@@ -37,7 +37,7 @@ PREF_RM=/nfs/turbo/umd-sabymath/Soham/BPref/exported_models/ant_pebble_1M/reward
 
 ENV_ID=Ant-v2
 STEPS=1000000
-SEEDS=(5 6 7)
+SEEDS=(6 8 9 10)
 
 SID=$SLURM_ARRAY_TASK_ID
 SEED=${SEEDS[$SID]}
@@ -63,7 +63,7 @@ export TF_CPP_MIN_LOG_LEVEL=2
 # ------------------------------
 # W&B project for Ant
 # ------------------------------
-RUN_NAME="PAIL_Ant1200_beta1_${STEPS}_s${SEED}"
+RUN_NAME="PAIL_Ant1200_beta5_${STEPS}_s${SEED}"
 export WANDB_PROJECT="SAIL_variants_ant"
 export WANDB_NAME="${RUN_NAME}"
 
@@ -104,7 +104,7 @@ PYTHONPATH="$PWD/.." python -u train_sail.py \
   --pref-reweight-teacher \
   --pref-rm "${PREF_RM}" \
   --pref-expect-obs-dim 111 \
-  --pref-beta 50.0 \
+  --pref-beta 5.0 \
   --pref-promote-quantile 0.5 \
   --pref-max-teacher-trajs 500 \
   --tensorboard-log "tb_logs/${RUN_NAME}" \

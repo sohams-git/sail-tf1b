@@ -1,18 +1,18 @@
 #!/bin/bash
-#SBATCH --job-name=sail_weighted_qpref_ant
+#SBATCH --job-name=sail_qpref_ant
 #SBATCH --partition=standard
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 #SBATCH --time=24:00:00
-#SBATCH --array=0-3
-#SBATCH --output=/nfs/turbo/umd-sabymath/Soham/sail-tf1b/stable-baselines/run/logs/slurm_weighted_qpref_ant_%A_%a.out
-#SBATCH --error=/nfs/turbo/umd-sabymath/Soham/sail-tf1b/stable-baselines/run/logs/slurm_weighted_qpref_ant_%A_%a.err
+#SBATCH --array=0-2
+#SBATCH --output=/nfs/turbo/umd-sabymath/Soham/sail-tf1b/stable-baselines/run/logs/slurm_qpref_ant_%A_%a.out
+#SBATCH --error=/nfs/turbo/umd-sabymath/Soham/sail-tf1b/stable-baselines/run/logs/slurm_qpref_ant_%A_%a.err
 #SBATCH --account=sabymath0
 
 set -euo pipefail
-echo "== Weighted SAIL (teacher reweight) + Qpref (TD3 critic ranking) | Ant-v2 =="
+echo "== SAIL: TD3 + Q-preference loss (Qpref) on critic | Ant-v2 =="
 date
 hostname
 echo "JOB=$SLURM_JOB_ID TASK=$SLURM_ARRAY_TASK_ID"
@@ -22,26 +22,21 @@ REPO_ROOT=/nfs/turbo/umd-sabymath/Soham/sail-tf1b
 RUN_DIR=${REPO_ROOT}/stable-baselines/run
 VENV=$HOME/.venvs/sail-tf1b
 
-# ---------------- Experiment ----------------
+# ---------------- Experiment knobs ----------------
 ENV_ID=Ant-v2
 STEPS=1000000
 EPISODES=10
-SEEDS=(5 8 9 10)
+SEEDS=(0 2 5)
 SEED=${SEEDS[$SLURM_ARRAY_TASK_ID]}
 
-# ---------------- Qpref ----------------
-QPREF_W=0.5
-QPREF_TEMP=1.0
-QPREF_BSZ=32
-QPREF_START=0
+# ---------------- Qpref hyperparams ----------------
+QPREF_W=0.5          # lambda (qpref_weight)
+QPREF_TEMP=1.0       # temperature T
+QPREF_BSZ=32         # number of pref pairs per critic update
+QPREF_START=0        # start step
 
-# ---------------- Preference-weighted SAIL ----------------
-# (teacher buffer is reweighted by exp(beta * J_phi))
-PREF_BETA=5.0
-PREF_PROMOTE_Q=0.5          # keep consistent with your PR-SAIL runs (optional, but recommended)
-PREF_MAX_TRAJ=500
-
-# ---------------- Offline Reward Model (Ant) ----------------
+# ---------------- Offline preference RM (Ant) ----------------
+# Used to compute preference returns J_phi for Qpref pairing.
 PREF_RM=/nfs/turbo/umd-sabymath/Soham/BPref/exported_models/ant_pebble_1M/reward_model_1000000_0.pt
 
 # ---------------- Ant teacher dataset ----------------
@@ -66,20 +61,19 @@ if [[ ! -f "${DATASET}" ]]; then
   exit 4
 fi
 
-echo "Seed=${SEED}"
 echo "Dataset: ${DATASET}"
 echo "Resolved dataset: $(readlink -f "${DATASET}")"
-echo "Pref RM: ${PREF_RM}"
+ls -lh "${DATASET}"
 
 cd "${RUN_DIR}"
 
 # ---------------- Run name ----------------
-RUN_NAME="WeightedQPREF_Ant1200_${STEPS}_s${SEED}"
+RUN_NAME="SAIL_QPREF0.5_Ant1200_${STEPS}_s${SEED}"
 
 # ---------------- W&B (Ant project) ----------------
 export WANDB_PROJECT="SAIL_variants_ant"
 export WANDB_NAME="${RUN_NAME}"
-export WANDB_GROUP="${ENV_ID}_weighted_qpref_${STEPS}"
+export WANDB_GROUP="${ENV_ID}_qpref_${STEPS}"
 export WANDB_SILENT=true
 
 echo "WANDB_PROJECT=${WANDB_PROJECT}"
@@ -101,11 +95,6 @@ PYTHONPATH="$PWD/.." python -u train_sail.py \
   --qpref-temp "${QPREF_TEMP}" \
   --qpref-batch-size "${QPREF_BSZ}" \
   --qpref-start-step "${QPREF_START}" \
-  \
-  --pref-reweight-teacher \
-  --pref-beta "${PREF_BETA}" \
-  --pref-promote-quantile "${PREF_PROMOTE_Q}" \
-  --pref-max-teacher-trajs "${PREF_MAX_TRAJ}" \
   \
   --pref-rm "${PREF_RM}" \
   --pref-expect-obs-dim 111 \

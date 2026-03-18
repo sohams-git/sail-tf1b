@@ -1,18 +1,18 @@
 #!/bin/bash
-#SBATCH --job-name=sail_weighted_qpref_ant
+#SBATCH --job-name=sail_weighted_tac_unf_swimmer
 #SBATCH --partition=standard
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 #SBATCH --time=24:00:00
-#SBATCH --array=0-3
-#SBATCH --output=/nfs/turbo/umd-sabymath/Soham/sail-tf1b/stable-baselines/run/logs/slurm_weighted_qpref_ant_%A_%a.out
-#SBATCH --error=/nfs/turbo/umd-sabymath/Soham/sail-tf1b/stable-baselines/run/logs/slurm_weighted_qpref_ant_%A_%a.err
+#SBATCH --array=0-4
+#SBATCH --output=/nfs/turbo/umd-sabymath/Soham/sail-tf1b/stable-baselines/run/logs/slurm_weighted_tac_unf_swimmer_%A_%a.out
+#SBATCH --error=/nfs/turbo/umd-sabymath/Soham/sail-tf1b/stable-baselines/run/logs/slurm_weighted_tac_unf_swimmer_%A_%a.err
 #SBATCH --account=sabymath0
 
 set -euo pipefail
-echo "== Weighted SAIL (teacher reweight) + Qpref (TD3 critic ranking) | Ant-v2 =="
+echo "== SAIL: WEIGHTED-DISC + SOFT-TAC (UNFILTERED PAIRS) | Swimmer-v2 =="
 date
 hostname
 echo "JOB=$SLURM_JOB_ID TASK=$SLURM_ARRAY_TASK_ID"
@@ -22,30 +22,18 @@ REPO_ROOT=/nfs/turbo/umd-sabymath/Soham/sail-tf1b
 RUN_DIR=${REPO_ROOT}/stable-baselines/run
 VENV=$HOME/.venvs/sail-tf1b
 
-# ---------------- Experiment ----------------
-ENV_ID=Ant-v2
+# ---------------- Experiment knobs ----------------
+ENV_ID=Swimmer-v2
 STEPS=1000000
-EPISODES=10
-SEEDS=(5 8 9 10)
+EPISODES=4
+SEEDS=(0 1 2 3 4)
 SEED=${SEEDS[$SLURM_ARRAY_TASK_ID]}
 
-# ---------------- Qpref ----------------
-QPREF_W=0.5
-QPREF_TEMP=1.0
-QPREF_BSZ=32
-QPREF_START=0
+# ---------------- Swimmer teacher dataset ----------------
+DATASET="${REPO_ROOT}/teacher_dataset/expert_data_no_img_Swimmer_scores_120_episodes_${EPISODES}.npz"
 
-# ---------------- Preference-weighted SAIL ----------------
-# (teacher buffer is reweighted by exp(beta * J_phi))
-PREF_BETA=5.0
-PREF_PROMOTE_Q=0.5          # keep consistent with your PR-SAIL runs (optional, but recommended)
-PREF_MAX_TRAJ=500
-
-# ---------------- Offline Reward Model (Ant) ----------------
-PREF_RM=/nfs/turbo/umd-sabymath/Soham/BPref/exported_models/ant_pebble_1M/reward_model_1000000_0.pt
-
-# ---------------- Ant teacher dataset ----------------
-DATASET="${REPO_ROOT}/teacher_dataset/expert_data_no_img_Ant_scores_1200_episodes_${EPISODES}.npz"
+# ---------------- Offline preference RM (Swimmer) ----------------
+PREF_RM=/nfs/turbo/umd-sabymath/Soham/BPref/exported_models/swimmer_pebble_1M/reward_model_1000000_0.pt
 
 # ---------------- MuJoCo / perf ----------------
 export MUJOCO_GL=egl
@@ -62,24 +50,24 @@ if [[ ! -f "${PREF_RM}" ]]; then
   exit 3
 fi
 if [[ ! -f "${DATASET}" ]]; then
-  echo "[ERROR] Missing Ant dataset: ${DATASET}" >&2
+  echo "[ERROR] Missing Swimmer dataset: ${DATASET}" >&2
   exit 4
 fi
 
-echo "Seed=${SEED}"
 echo "Dataset: ${DATASET}"
 echo "Resolved dataset: $(readlink -f "${DATASET}")"
-echo "Pref RM: ${PREF_RM}"
+ls -lh "${DATASET}"
 
 cd "${RUN_DIR}"
 
 # ---------------- Run name ----------------
-RUN_NAME="WeightedQPREF_Ant1200_${STEPS}_s${SEED}"
+RUN_NAME="PAILTAC_Swimmer120_${STEPS}_s${SEED}"
 
-# ---------------- W&B (Ant project) ----------------
-export WANDB_PROJECT="SAIL_variants_ant"
+# ---------------- W&B (Swimmer project) ----------------
+# NOTE: if your code hardcodes the project to SAIL_variants, this env var may not override it.
+export WANDB_PROJECT="SAIL_variants_swimmer"
 export WANDB_NAME="${RUN_NAME}"
-export WANDB_GROUP="${ENV_ID}_weighted_qpref_${STEPS}"
+export WANDB_GROUP="${ENV_ID}_weighted_softTAC_${STEPS}"
 export WANDB_SILENT=true
 
 echo "WANDB_PROJECT=${WANDB_PROJECT}"
@@ -96,19 +84,23 @@ PYTHONPATH="$PWD/.." python -u train_sail.py \
   --n-timesteps "${STEPS}" \
   --n-episodes "${EPISODES}" \
   \
-  --qpref \
-  --qpref-weight "${QPREF_W}" \
-  --qpref-temp "${QPREF_TEMP}" \
-  --qpref-batch-size "${QPREF_BSZ}" \
-  --qpref-start-step "${QPREF_START}" \
-  \
   --pref-reweight-teacher \
-  --pref-beta "${PREF_BETA}" \
-  --pref-promote-quantile "${PREF_PROMOTE_Q}" \
-  --pref-max-teacher-trajs "${PREF_MAX_TRAJ}" \
+  --pref-beta 50.0 \
+  --pref-promote-quantile 0.5 \
+  --pref-max-teacher-trajs 500 \
+  \
+  --pref-rank-disc \
+  --pref-rank-weight 0.0 \
+  --pref-rank-batch-size 32 \
+  \
+  --pref-soft-rank-disc \
+  --pref-soft-rank-weight 0.5 \
+  --pref-soft-rank-temp 1.0 \
+  \
+  --pref-pair-filter none \
   \
   --pref-rm "${PREF_RM}" \
-  --pref-expect-obs-dim 111 \
+  --pref-expect-obs-dim 8 \
   --pref-norm zscore \
   --pref-clip 5.0 \
   \

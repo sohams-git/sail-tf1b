@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=8G
 #SBATCH --time=24:00:00
-#SBATCH --array=0                # 3 seeds: index 0,1,2
+#SBATCH --array=0-3                # 3 seeds: index 0,1,2
 #SBATCH --output=/nfs/turbo/umd-sabymath/Soham/sail-tf1b/stable-baselines/run/logs/slurm_prefrew5_500e8_%A_%a.out
 #SBATCH --error=/nfs/turbo/umd-sabymath/Soham/sail-tf1b/stable-baselines/run/logs/slurm_prefrew5_500e8_%A_%a.err
 #SBATCH --account=sabymath0
@@ -24,7 +24,7 @@ VENV=$HOME/.venvs/sail-tf1b
 
 # Legacy teacher dataset you want to use (real file)
 EPISODES=4
-ORIG_DATASET="${REPO_ROOT}/stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_500_episodes_4_legacy_exact.npz"
+ORIG_DATASET="${REPO_ROOT}/stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_150_episodes_4_legacy_exact.npz"
 
 # IMPORTANT: this must match what train_sail.py expects:
 # ../../teacher_dataset/expert_data_no_img_HalfCheetah_scores_5600_episodes_${EPISODES}.npz
@@ -35,7 +35,7 @@ PREF_RM=/nfs/turbo/umd-sridas/Soham/BPref/runs/halfcheetah/pebble_oracle_b500_se
 
 ENV_ID=HalfCheetah-v2
 STEPS=1000000             # change for shorter/longer training
-SEEDS=(10)            # 3 runs = 3 array indices
+SEEDS=(0 1 2 3 4)            # 3 runs = 3 array indices
 # ----------------------------------------------------------------------
 
 SID=$SLURM_ARRAY_TASK_ID
@@ -95,10 +95,10 @@ COMMON_ARGS=(
   --n-episodes "${EPISODES}"
 )
 
-RUN_NAME="PAIL_${STEPS}_s${SEED}"
+RUN_NAME="PAIL150_${STEPS}_s${SEED}"
 
 # ---- W&B naming from sbatch (Option B) ----
-export WANDB_PROJECT="SAIL_variants"
+export WANDB_PROJECT="SAIL_variants_HC"
 export WANDB_NAME="${RUN_NAME}"
 # export WANDB_GROUP="${ENV_ID}_${VAR}_${STEPS}"
 # Optional: your account/entity (only if needed)

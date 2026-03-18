@@ -501,6 +501,26 @@ if __name__ == '__main__':
     parser.add_argument('--pref-rm', type=str, default=None)
     parser.add_argument('--pref-expect-obs-dim', type=int, default=17)
 
+
+    # --- PBRS BPref -> discriminator shaping (policy-invariant)
+    parser.add_argument(
+        "--add-pref-pbrs-to-disc",
+        action="store_true",
+        help="Potential-based shaping using pref RM: r = r_disc + w*(gamma*Phi(s',a') - Phi(s,a))."
+    )
+    parser.add_argument(
+        "--pref-pbrs-weight",
+        type=float,
+        default=1.0,
+        help="Weight on PBRS shaping term."
+    )
+    parser.add_argument(
+        "--pref-pbrs-clip",
+        type=float,
+        default=10.0,
+        help="Clip Phi values to [-pref-pbrs-clip, pref-pbrs-clip] before computing shaping."
+    )
+
         # --- Preference-reweighted teacher buffer (PR-SAIL) ---
     parser.add_argument(
         '--pref-reweight-teacher',
@@ -701,6 +721,8 @@ type=int)
                     help='Use expert weights in discriminator expert loss (weighted discriminator). Default off.')
 
     args = parser.parse_args()
+    if getattr(args, "add_pref_to_disc", False) and getattr(args, "add_pref_pbrs_to_disc", False):
+        raise ValueError("Choose only one: --add-pref-to-disc OR --add-pref-pbrs-to-disc (not both).")
 
     ##__PREF_INIT__
     rm = None
@@ -715,6 +737,9 @@ type=int)
         print('[SAIL] Using vanilla TD3 (no pref critic)')
     if args.add_pref_to_disc:
         print('[SAIL] Additive BPref->Discriminator enabled (critic unchanged)')
+
+    if getattr(args, "add_pref_pbrs_to_disc", False):
+        print('[SAIL] PBRS BPref->Discriminator enabled (policy-invariant shaping)')
 
     # build log_dir
     # $prefix/$task/$algo/$env/rank$seed"
@@ -833,6 +858,11 @@ type=int)
     # >>> Additive BPref->Disc settings (only used if --add-pref-to-disc is set)
     config['add_pref_to_disc'] = bool(args.add_pref_to_disc)
 
+    # >>> PBRS preference shaping (policy-invariant)
+    config['add_pref_pbrs_to_disc'] = bool(getattr(args, "add_pref_pbrs_to_disc", False))
+    config['pref_pbrs_weight'] = float(getattr(args, "pref_pbrs_weight", 1.0))
+    config['pref_pbrs_clip'] = float(getattr(args, "pref_pbrs_clip", 10.0))
+
     # >>> New: preference-reweighted teacher buffer flag
     config['pref_reweight_teacher'] = bool(getattr(args, 'pref_reweight_teacher', False))
 
@@ -878,6 +908,7 @@ type=int)
     # Common pref-RM config fields (used by add-pref-to-disc AND pref-reweight-teacher AND rank/filter)
     need_pref_rm = (
         config.get('add_pref_to_disc', False)
+        or config.get('add_pref_pbrs_to_disc', False)
         or config.get('pref_reweight_teacher', False)
         or config.get('pref_rank_disc', False)
         or config.get('qpref', False)
@@ -893,8 +924,13 @@ type=int)
 
         config['pref_rm_path'] = args.pref_rm
         config['pref_expect_obs_dim'] = args.pref_expect_obs_dim
-        config['pref_norm'] = args.pref_norm          # 'zscore' | 'iqr-match' | 'none'
-        config['pref_clip'] = args.pref_clip          # e.g., 5.0
+        config['pref_rm_path'] = args.pref_rm
+        config['pref_expect_obs_dim'] = args.pref_expect_obs_dim
+
+        # Only additive variant uses these normalization knobs
+        if config.get('add_pref_to_disc', False):
+            config['pref_norm'] = args.pref_norm          # 'zscore' | 'iqr-match' | 'none'
+            config['pref_clip'] = args.pref_clip          # e.g., 5.0
 
     # Only additive BPref->Disc uses these:
     if config['add_pref_to_disc']:

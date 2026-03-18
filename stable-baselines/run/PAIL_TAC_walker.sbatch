@@ -1,18 +1,18 @@
 #!/bin/bash
-#SBATCH --job-name=sail_weighted_qpref_ant
+#SBATCH --job-name=sail_weighted_tac_unf_walker
 #SBATCH --partition=standard
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 #SBATCH --time=24:00:00
-#SBATCH --array=0-3
-#SBATCH --output=/nfs/turbo/umd-sabymath/Soham/sail-tf1b/stable-baselines/run/logs/slurm_weighted_qpref_ant_%A_%a.out
-#SBATCH --error=/nfs/turbo/umd-sabymath/Soham/sail-tf1b/stable-baselines/run/logs/slurm_weighted_qpref_ant_%A_%a.err
+#SBATCH --array=0-5
+#SBATCH --output=/nfs/turbo/umd-sabymath/Soham/sail-tf1b/stable-baselines/run/logs/slurm_weighted_tac_unf_walker_%A_%a.out
+#SBATCH --error=/nfs/turbo/umd-sabymath/Soham/sail-tf1b/stable-baselines/run/logs/slurm_weighted_tac_unf_walker_%A_%a.err
 #SBATCH --account=sabymath0
 
 set -euo pipefail
-echo "== Weighted SAIL (teacher reweight) + Qpref (TD3 critic ranking) | Ant-v2 =="
+echo "== SAIL: WEIGHTED-DISC + SOFT-TAC (UNFILTERED PAIRS) | Walker2d-v2 =="
 date
 hostname
 echo "JOB=$SLURM_JOB_ID TASK=$SLURM_ARRAY_TASK_ID"
@@ -22,30 +22,18 @@ REPO_ROOT=/nfs/turbo/umd-sabymath/Soham/sail-tf1b
 RUN_DIR=${REPO_ROOT}/stable-baselines/run
 VENV=$HOME/.venvs/sail-tf1b
 
-# ---------------- Experiment ----------------
-ENV_ID=Ant-v2
+# ---------------- Experiment knobs ----------------
+ENV_ID=Walker2d-v2
 STEPS=1000000
 EPISODES=10
-SEEDS=(5 8 9 10)
+SEEDS=(3 5 7 8 9 10)
 SEED=${SEEDS[$SLURM_ARRAY_TASK_ID]}
 
-# ---------------- Qpref ----------------
-QPREF_W=0.5
-QPREF_TEMP=1.0
-QPREF_BSZ=32
-QPREF_START=0
+# ---------------- Walker2d teacher dataset ----------------
+DATASET="${REPO_ROOT}/teacher_dataset/expert_data_no_img_Walker2d_scores_1500_episodes_${EPISODES}.npz"
 
-# ---------------- Preference-weighted SAIL ----------------
-# (teacher buffer is reweighted by exp(beta * J_phi))
-PREF_BETA=5.0
-PREF_PROMOTE_Q=0.5          # keep consistent with your PR-SAIL runs (optional, but recommended)
-PREF_MAX_TRAJ=500
-
-# ---------------- Offline Reward Model (Ant) ----------------
-PREF_RM=/nfs/turbo/umd-sabymath/Soham/BPref/exported_models/ant_pebble_1M/reward_model_1000000_0.pt
-
-# ---------------- Ant teacher dataset ----------------
-DATASET="${REPO_ROOT}/teacher_dataset/expert_data_no_img_Ant_scores_1200_episodes_${EPISODES}.npz"
+# ---------------- Offline preference RM (Walker2d) ----------------
+PREF_RM=/nfs/turbo/umd-sabymath/Soham/BPref/exported_models/walker2d_pebble_1M/reward_model_1000000_0.pt
 
 # ---------------- MuJoCo / perf ----------------
 export MUJOCO_GL=egl
@@ -62,24 +50,23 @@ if [[ ! -f "${PREF_RM}" ]]; then
   exit 3
 fi
 if [[ ! -f "${DATASET}" ]]; then
-  echo "[ERROR] Missing Ant dataset: ${DATASET}" >&2
+  echo "[ERROR] Missing Walker2d dataset: ${DATASET}" >&2
   exit 4
 fi
 
-echo "Seed=${SEED}"
 echo "Dataset: ${DATASET}"
 echo "Resolved dataset: $(readlink -f "${DATASET}")"
-echo "Pref RM: ${PREF_RM}"
+ls -lh "${DATASET}"
 
 cd "${RUN_DIR}"
 
 # ---------------- Run name ----------------
-RUN_NAME="WeightedQPREF_Ant1200_${STEPS}_s${SEED}"
+RUN_NAME="PAILTAC_b1_Walker1500_${STEPS}_s${SEED}"
 
-# ---------------- W&B (Ant project) ----------------
-export WANDB_PROJECT="SAIL_variants_ant"
+# ---------------- W&B (Walker2d project) ----------------
+export WANDB_PROJECT="SAIL_variants_walker2d"
 export WANDB_NAME="${RUN_NAME}"
-export WANDB_GROUP="${ENV_ID}_weighted_qpref_${STEPS}"
+export WANDB_GROUP="${ENV_ID}_weighted_softTAC_${STEPS}"
 export WANDB_SILENT=true
 
 echo "WANDB_PROJECT=${WANDB_PROJECT}"
@@ -96,19 +83,22 @@ PYTHONPATH="$PWD/.." python -u train_sail.py \
   --n-timesteps "${STEPS}" \
   --n-episodes "${EPISODES}" \
   \
-  --qpref \
-  --qpref-weight "${QPREF_W}" \
-  --qpref-temp "${QPREF_TEMP}" \
-  --qpref-batch-size "${QPREF_BSZ}" \
-  --qpref-start-step "${QPREF_START}" \
-  \
   --pref-reweight-teacher \
-  --pref-beta "${PREF_BETA}" \
-  --pref-promote-quantile "${PREF_PROMOTE_Q}" \
-  --pref-max-teacher-trajs "${PREF_MAX_TRAJ}" \
+  --pref-beta 1.0 \
+  --pref-promote-quantile 0.5 \
+  --pref-max-teacher-trajs 500 \
+  \
+  --pref-rank-disc \
+  --pref-rank-weight 0.0 \
+  --pref-rank-batch-size 32 \
+  \
+  --pref-soft-rank-weight 0.1 \
+  --pref-soft-rank-temp 1.0 \
+  \
+  --pref-pair-filter none \
   \
   --pref-rm "${PREF_RM}" \
-  --pref-expect-obs-dim 111 \
+  --pref-expect-obs-dim 17 \
   --pref-norm zscore \
   --pref-clip 5.0 \
   \

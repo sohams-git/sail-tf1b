@@ -1,18 +1,18 @@
 #!/bin/bash
-#SBATCH --job-name=sail_cpu_all3
+#SBATCH --job-name=sail_hc_pbrsdisc
 #SBATCH --partition=standard
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=8G
 #SBATCH --time=24:00:00
-#SBATCH --array=0-4                         # 3 variants = 3 tasks
-#SBATCH --output=/nfs/turbo/umd-sabymath/Soham/sail-tf1b/stable-baselines/run/logs/slurm_%A_%a.out
-#SBATCH --error=/nfs/turbo/umd-sabymath/Soham/sail-tf1b/stable-baselines/run/logs/slurm_%A_%a.err
+#SBATCH --array=0
+#SBATCH --output=/nfs/turbo/umd-sabymath/Soham/sail-tf1b/stable-baselines/run/logs/slurm_hc_pbrsdisc_%A_%a.out
+#SBATCH --error=/nfs/turbo/umd-sabymath/Soham/sail-tf1b/stable-baselines/run/logs/slurm_hc_pbrsdisc_%A_%a.err
 #SBATCH --account=sabymath0
 
 set -euo pipefail
-echo "== SAIL CPU run =="
+echo "== SAIL HalfCheetah PBRS->Discriminator (policy-invariant shaping) =="
 date
 hostname
 echo "JOB=$SLURM_JOB_ID TASK=$SLURM_ARRAY_TASK_ID"
@@ -26,20 +26,19 @@ VENV=$HOME/.venvs/sail-tf1b
 TEACHER_SRC=${REPO_ROOT}/teacher_dataset
 
 # Choose the teacher dataset file you want this run to use:
-# (example: your 3000-episode legacy-exact file)
-FORCE_DATASET="${REPO_ROOT}/stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_700_episodes_4_legacy_exact.npz"
+FORCE_DATASET="${REPO_ROOT}/stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_500_episodes_4_legacy_exact.npz"
 EPISODES=4   # must match the suffix in the filename SAIL builds
 # ----------------------------------------------------------------------
 
-# (Only used for non-vanilla variants)
+# Pref RM (PBRS potential source)
 PREF_RM=/nfs/turbo/umd-sridas/Soham/BPref/runs/halfcheetah/pebble_oracle_b500_seg50_disa_s0/exports/reward_model_ts.pt
 
 ENV_ID=HalfCheetah-v2
-STEPS=1000000      # quick run; increase for full training
-SEEDS=(0 1 2 3)
-# VARIANTS=(vanilla critic adddisc)
-# VARIANTS=(adddisc)
-VARIANTS=(vanilla)
+STEPS=1000000
+SEEDS=(4)
+
+# single variant: PBRS-to-disc
+VARIANTS=(pbrsdisc)
 
 VID=$(( SLURM_ARRAY_TASK_ID % ${#VARIANTS[@]} ))
 SID=$(( SLURM_ARRAY_TASK_ID / ${#VARIANTS[@]} ))
@@ -97,36 +96,30 @@ COMMON_ARGS=(
   --n-episodes "${EPISODES}"
 )
 
-case "${VAR}" in
-  vanilla)
-    RUN_NAME="vanillaSAIL700ep_${STEPS}_s${SEED}"
-    EXTRA_ARGS=()
-    ;;
-
-  critic)
-    RUN_NAME="bpref_criticC_50_hc_v2_${STEPS}_s${SEED}"
-    EXTRA_ARGS=( --use-pref-critic --pref-rm "${PREF_RM}" --pref-expect-obs-dim 17 --lambda-ref 0.10 )
-    ;;
-
-  adddisc)
-    RUN_NAME="discsail500_${STEPS}_s${SEED}"
-    EXTRA_ARGS=( --add-pref-to-disc --pref-rm "${PREF_RM}" --pref-expect-obs-dim 17 --pref-weight 1.0 --pref-norm zscore --pref-clip 5.0 )
-    ;;
-
-  *)
-    echo "Unknown variant ${VAR}" >&2; exit 2;;
-esac
+# ---------------- PBRS->DISC variant ----------------
+# NOTE:
+# - This assumes you added the new argparse flags in train_sail.py:
+#     --add-pref-pbrs-to-disc
+#     --pref-pbrs-weight
+#     --pref-pbrs-clip
+# - And you updated sail.py get_imitate_reward to accept next_observation/next_action
+RUN_NAME="pbrsdiscSAIL_hc_w0.5_${STEPS}_s${SEED}"
+EXTRA_ARGS=(
+  --pref-rm "${PREF_RM}"
+  --pref-expect-obs-dim 17
+  --add-pref-pbrs-to-disc
+  --pref-pbrs-weight 40.0
+  --pref-pbrs-clip 10.0
+)
 
 # ---- W&B naming from sbatch (Option B) ----
-export WANDB_PROJECT="SAIL_variants_HC"
+export WANDB_PROJECT="SAIL_variants"
 export WANDB_NAME="${RUN_NAME}"
 # export WANDB_GROUP="${ENV_ID}_${VAR}_${STEPS}"
-# Optional: your account/entity (only if needed)
-# export WANDB_ENTITY="sohams1-university-of-michigan"
 # ------------------------------------------
 
-# Safety check for pref model when required
-if [[ "${VAR}" != "vanilla" ]] && [[ ! -f "${PREF_RM}" ]]; then
+# Safety check for pref model
+if [[ ! -f "${PREF_RM}" ]]; then
   echo "Missing pref reward model: ${PREF_RM}" >&2
   exit 3
 fi

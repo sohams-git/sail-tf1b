@@ -33,7 +33,7 @@ SEED=${SEEDS[$SID]}
 PREF_RM=/nfs/turbo/umd-sridas/Soham/BPref/runs/halfcheetah/pebble_oracle_b500_seg50_disa_s0/exports/reward_model_ts.pt
 
 # Teacher dataset (legacy symlink)
-ORIG_DATASET="${REPO_ROOT}/stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_500_episodes_${EPISODES}_legacy_exact.npz"
+ORIG_DATASET="${REPO_ROOT}/stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_150_episodes_${EPISODES}_legacy_exact.npz"
 TARGET_LINK="${REPO_ROOT}/teacher_dataset/expert_data_no_img_HalfCheetah_scores_5600_episodes_${EPISODES}.npz"
 
 # ------------- Env (CPU MuJoCo) -------------
@@ -59,9 +59,9 @@ ln -sfn "${ORIG_DATASET}" "${TARGET_LINK}"
 
 cd "${RUN_DIR}"
 
-RUN_NAME="PAIL_Preference_Ranking_${STEPS}_s${SEED}"
+RUN_NAME="PAIL_Preference_Ranking150_${STEPS}_s${SEED}"
 
-export WANDB_PROJECT="SAIL_variants"
+export WANDB_PROJECT="SAIL_variants_HC"
 export WANDB_NAME="${RUN_NAME}"
 
 set -x

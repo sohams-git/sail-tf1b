@@ -1,18 +1,18 @@
 #!/bin/bash
-#SBATCH --job-name=sail_weighted_qpref_ant
+#SBATCH --job-name=sail_weighted_qpref_walker
 #SBATCH --partition=standard
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 #SBATCH --time=24:00:00
-#SBATCH --array=0-3
-#SBATCH --output=/nfs/turbo/umd-sabymath/Soham/sail-tf1b/stable-baselines/run/logs/slurm_weighted_qpref_ant_%A_%a.out
-#SBATCH --error=/nfs/turbo/umd-sabymath/Soham/sail-tf1b/stable-baselines/run/logs/slurm_weighted_qpref_ant_%A_%a.err
+#SBATCH --array=0-4
+#SBATCH --output=/nfs/turbo/umd-sabymath/Soham/sail-tf1b/stable-baselines/run/logs/slurm_weighted_qpref_walker_%A_%a.out
+#SBATCH --error=/nfs/turbo/umd-sabymath/Soham/sail-tf1b/stable-baselines/run/logs/slurm_weighted_qpref_walker_%A_%a.err
 #SBATCH --account=sabymath0
 
 set -euo pipefail
-echo "== Weighted SAIL (teacher reweight) + Qpref (TD3 critic ranking) | Ant-v2 =="
+echo "== Weighted SAIL (teacher reweight) + Qpref (TD3 critic ranking) | Walker2d-v2 =="
 date
 hostname
 echo "JOB=$SLURM_JOB_ID TASK=$SLURM_ARRAY_TASK_ID"
@@ -23,10 +23,10 @@ RUN_DIR=${REPO_ROOT}/stable-baselines/run
 VENV=$HOME/.venvs/sail-tf1b
 
 # ---------------- Experiment ----------------
-ENV_ID=Ant-v2
+ENV_ID=Walker2d-v2
 STEPS=1000000
 EPISODES=10
-SEEDS=(5 8 9 10)
+SEEDS=(0 1 2 3 4)
 SEED=${SEEDS[$SLURM_ARRAY_TASK_ID]}
 
 # ---------------- Qpref ----------------
@@ -37,15 +37,15 @@ QPREF_START=0
 
 # ---------------- Preference-weighted SAIL ----------------
 # (teacher buffer is reweighted by exp(beta * J_phi))
-PREF_BETA=5.0
+PREF_BETA=1.0
 PREF_PROMOTE_Q=0.5          # keep consistent with your PR-SAIL runs (optional, but recommended)
 PREF_MAX_TRAJ=500
 
-# ---------------- Offline Reward Model (Ant) ----------------
-PREF_RM=/nfs/turbo/umd-sabymath/Soham/BPref/exported_models/ant_pebble_1M/reward_model_1000000_0.pt
+# ---------------- Offline Reward Model (Walker2d) ----------------
+PREF_RM=/nfs/turbo/umd-sabymath/Soham/BPref/exported_models/walker2d_pebble_1M/reward_model_1000000_0.pt
 
-# ---------------- Ant teacher dataset ----------------
-DATASET="${REPO_ROOT}/teacher_dataset/expert_data_no_img_Ant_scores_1200_episodes_${EPISODES}.npz"
+# ---------------- Walker2d teacher dataset ----------------
+DATASET="${REPO_ROOT}/teacher_dataset/expert_data_no_img_Walker2d_scores_1500_episodes_${EPISODES}.npz"
 
 # ---------------- MuJoCo / perf ----------------
 export MUJOCO_GL=egl
@@ -62,7 +62,7 @@ if [[ ! -f "${PREF_RM}" ]]; then
   exit 3
 fi
 if [[ ! -f "${DATASET}" ]]; then
-  echo "[ERROR] Missing Ant dataset: ${DATASET}" >&2
+  echo "[ERROR] Missing Walker2d dataset: ${DATASET}" >&2
   exit 4
 fi
 
@@ -74,10 +74,10 @@ echo "Pref RM: ${PREF_RM}"
 cd "${RUN_DIR}"
 
 # ---------------- Run name ----------------
-RUN_NAME="WeightedQPREF_Ant1200_${STEPS}_s${SEED}"
+RUN_NAME="WeightedQPREF_Walker1500_${STEPS}_s${SEED}"
 
-# ---------------- W&B (Ant project) ----------------
-export WANDB_PROJECT="SAIL_variants_ant"
+# ---------------- W&B (Walker2d project) ----------------
+export WANDB_PROJECT="SAIL_variants_walker2d"
 export WANDB_NAME="${RUN_NAME}"
 export WANDB_GROUP="${ENV_ID}_weighted_qpref_${STEPS}"
 export WANDB_SILENT=true
@@ -87,6 +87,9 @@ echo "WANDB_NAME=${WANDB_NAME}"
 echo "Using python: $(which python)"
 python --version
 
+# ---------------- Training ----------------
+# IMPORTANT: Walker2d-v2 obs_dim is typically 17.
+# If your exported RM was trained with a different obs dim, change this to match.
 set -x
 PYTHONPATH="$PWD/.." python -u train_sail.py \
   --env "${ENV_ID}" \
@@ -108,7 +111,7 @@ PYTHONPATH="$PWD/.." python -u train_sail.py \
   --pref-max-teacher-trajs "${PREF_MAX_TRAJ}" \
   \
   --pref-rm "${PREF_RM}" \
-  --pref-expect-obs-dim 111 \
+  --pref-expect-obs-dim 17 \
   --pref-norm zscore \
   --pref-clip 5.0 \
   \

@@ -467,7 +467,13 @@ class SAIL(OffPolicyRLModel):
         # use rewards from GAIL
         ##############################################
         if self.using_gail:
-            rewards = self.get_imitate_reward(batch_obs, batch_actions, batch_rewards, batch_if_demos)
+            next_actions = self.policy_tf.step(batch_next_obs)
+            rewards = self.get_imitate_reward(
+                batch_obs,
+                batch_actions,
+                next_observation=batch_next_obs,
+                next_action=next_actions
+            )
             if self.using_return:
                 rewards = self.combine_both_rewards(rewards, batch_true_rewards, step, coeff=1)
         else:
@@ -607,6 +613,53 @@ class SAIL(OffPolicyRLModel):
             self._pref_teacher_rm = None
 
         return self._pref_teacher_rm
+    
+        # ======================================================================
+    # Preference potential-based shaping (PBRS) for discriminator reward
+    # ======================================================================
+    def _ensure_pref_add_rm(self):
+        """
+        Lazy-load preference RM used for potential-based shaping addition into disc reward.
+        This is separate from teacher reweighting loader to keep concerns isolated.
+        """
+        if hasattr(self, "_pref_add_rm") and (self._pref_add_rm is not None):
+            return self._pref_add_rm
+
+        cfg = getattr(self, "config", None)
+        if cfg is None:
+            return None
+
+        path = cfg.get("pref_rm_path", None)
+        if not path:
+            return None
+
+        try:
+            from stable_baselines.common.pref_rm_eval import PrefRewardModel
+            expect = int(cfg.get("pref_expect_obs_dim", 17))
+            self._pref_add_rm = PrefRewardModel(path, expect_obs_dim=expect)
+            if not getattr(self, "_pref_add_loaded_banner", False):
+                print("[SAIL:PBRS] Loaded pref RM for shaping:", path)
+                self._pref_add_loaded_banner = True
+            return self._pref_add_rm
+        except Exception as e:
+            if not getattr(self, "_pref_add_err_once", False):
+                print("[SAIL:PBRS] ERROR loading pref RM:", e)
+                self._pref_add_err_once = True
+            self._pref_add_rm = None
+            return None
+
+
+    def _pref_potential(self, obs, act):
+        """
+        Phi(s,a) = r_phi(s,a) from the preference RM.
+        Returns np.array shape (N,)
+        """
+        rm = self._ensure_pref_add_rm()
+        if rm is None:
+            return None
+        r = rm.reward(obs, act)
+        r = np.asarray(r).reshape(-1)
+        return r
 
     def _recompute_pref_teacher_weights(self):
         """
@@ -1848,129 +1901,105 @@ class SAIL(OffPolicyRLModel):
         bonus = beta * self.explorer.get_bonus(obs, action, next_obs, sess=self.sess)
         return bonus
 
-    def get_imitate_reward(self, observation, action, true_reward, if_demo):
-
+    def get_imitate_reward(self, observation, action, next_observation=None, next_action=None):
         # base discriminator reward (GAIL/AIRL unchanged)
-
         _, p = self.discriminator.get_confidence(observation, action, sess=self.sess)
 
         mode = self.config['shaping_mode']
-
         if 'airl' in mode:
-
             p = np.clip(p, 1e-2, 1 - 1e-2)
-
             r_gail = np.log(np.clip(p / (1 - p), 1e-3, 1e3)) / 10
-
         else:
+            r_gail = -np.log(1 - p + 1e-8)
 
-            r_gail = - np.log(1 - p + 1e-8)
-
-    
-
-        # Optionally add preference-model reward to discriminator reward
-
-        if self.config.get('add_pref_to_disc', False):
-
+        # ------------------------------------------------------------
+        # PBRS: preference potential-based shaping (policy-invariant)
+        # r' = r_disc + lambda * (gamma * Phi(s',a') - Phi(s,a))
+        # where Phi(s,a) = r_phi(s,a) from the preference RM
+        # ------------------------------------------------------------
+        if self.config.get("add_pref_pbrs_to_disc", False):
             try:
+                # PBRS needs next obs/action; if missing, skip shaping safely
+                if (next_observation is None) or (next_action is None):
+                    return r_gail
 
-                # lazy-load pref RM once
-
+                # lazy-load pref RM once (reuse your existing fields)
                 if not hasattr(self, "_pref_add_rm"):
-
                     self._pref_add_rm = None
-
                     self._pref_add_err_once = False
-
                     self._pref_add_loaded_banner = False
 
                 if self._pref_add_rm is None and not self._pref_add_err_once:
-
-                    path = self.config.get('pref_rm_path', None)
-
+                    path = self.config.get("pref_rm_path", None)
                     if path:
-
                         from stable_baselines.common.pref_rm_eval import PrefRewardModel
-
-                        expect = int(self.config.get('pref_expect_obs_dim', 17))
-
+                        expect = int(self.config.get("pref_expect_obs_dim", 17))
                         self._pref_add_rm = PrefRewardModel(path, expect_obs_dim=expect)
-
                         if not self._pref_add_loaded_banner:
-
-                            print("[SAIL:add-pref-to-disc] Loaded pref RM:", path, "norm=", self.config.get('pref_norm', 'zscore'), "weight=", self.config.get('pref_weight', 1.0), "clip=", self.config.get('pref_clip', 5.0))
-
+                            print("[SAIL:PBRS] Loaded pref RM:", path,
+                                "weight=", self.config.get("pref_pbrs_weight", 1.0),
+                                "clip=", self.config.get("pref_pbrs_clip", 10.0))
                             self._pref_add_loaded_banner = True
-
                     else:
-
                         self._pref_add_err_once = True
 
-    
-
                 if self._pref_add_rm is not None:
+                    # Phi(s,a) and Phi(s',a')
+                    phi_t = self._pref_add_rm.reward(observation, action)
+                    phi_tp1 = self._pref_add_rm.reward(next_observation, next_action)
 
-                    # BPref supports (obs) or (obs, act) or (obs, act, next_obs). We pass (obs, act).
+                    phi_t = np.asarray(phi_t).reshape(-1)
+                    phi_tp1 = np.asarray(phi_tp1).reshape(-1)
 
-                    r_pref = self._pref_add_rm.reward(observation, action)
+                    # IMPORTANT: avoid per-batch zscore normalization for PBRS
+                    clip_v = float(self.config.get("pref_pbrs_clip", 10.0))
+                    phi_t = np.clip(phi_t, -clip_v, clip_v)
+                    phi_tp1 = np.clip(phi_tp1, -clip_v, clip_v)
 
-                    r_pref = np.asarray(r_pref).reshape(-1)  # shape (N,)
-                    if not hasattr(self, "_pref_debug_once"):
-                        self._pref_debug_once = True
-                        print("[DEBUG] r_gail stats:",
-                            float(np.min(r_gail)), float(np.mean(r_gail)), float(np.max(r_gail)))
-                        print("[DEBUG] r_pref stats:",
-                            float(np.min(r_pref)), float(np.mean(r_pref)), float(np.max(r_pref)))
+                    lam = float(self.config.get("pref_pbrs_weight", 1.0))
+                    shaping = self.gamma * phi_tp1 - phi_t
+                    scaled_shaping = lam * shaping
 
-    
+                    # ---- DEBUG PRINT (only once) ----
+                    if not hasattr(self, "_pbrs_debug_once"):
+                        self._pbrs_debug_once = True
 
-                    norm = self.config.get('pref_norm', 'zscore')
+                        print("\n========== PBRS DEBUG ==========")
+                        print("gamma:", self.gamma)
+                        print("lambda:", lam)
 
-                    if norm == 'zscore':
+                        print("\n--- r_disc stats ---")
+                        print("min:", float(np.min(r_gail)),
+                            "mean:", float(np.mean(r_gail)),
+                            "max:", float(np.max(r_gail)))
 
-                        mu, sd = float(np.mean(r_pref)), float(np.std(r_pref))
+                        print("\n--- phi_t stats ---")
+                        print("min:", float(np.min(phi_t)),
+                            "mean:", float(np.mean(phi_t)),
+                            "max:", float(np.max(phi_t)))
 
-                        r_pref = (r_pref - mu) / (sd + 1e-8)
+                        print("\n--- phi_tp1 stats ---")
+                        print("min:", float(np.min(phi_tp1)),
+                            "mean:", float(np.mean(phi_tp1)),
+                            "max:", float(np.max(phi_tp1)))
 
-                    elif norm == 'iqr-match':
+                        print("\n--- delta_phi stats (gamma*phi_tp1 - phi_t) ---")
+                        print("min:", float(np.min(shaping)),
+                            "mean:", float(np.mean(shaping)),
+                            "max:", float(np.max(shaping)))
 
-                        # match IQR scale of r_gail
+                        print("\n--- lambda * delta_phi stats ---")
+                        print("min:", float(np.min(scaled_shaping)),
+                            "mean:", float(np.mean(scaled_shaping)),
+                            "max:", float(np.max(scaled_shaping)))
 
-                        rg = np.asarray(r_gail).reshape(-1)
-
-                        q75p, q25p = np.percentile(r_pref, 75), np.percentile(r_pref, 25)
-
-                        q75g, q25g = np.percentile(rg, 75), np.percentile(rg, 25)
-
-                        iqr_p = (q75p - q25p) + 1e-8
-
-                        iqr_g = (q75g - q25g)
-
-                        med_p = 0.5 * (q75p + q25p)
-
-                        r_pref = (r_pref - med_p) * (iqr_g / iqr_p)
-
-                    # else: 'none' → no normalization
-
-    
-
-                    clip_v = float(self.config.get('pref_clip', 5.0))
-
-                    r_pref = np.clip(r_pref, -clip_v, clip_v)
-
-                    w = float(self.config.get('pref_weight', 1.0))
-
-                    r_gail = np.asarray(r_gail).reshape(-1) + w * r_pref
+                        print("=================================\n")
+                    r_gail = np.asarray(r_gail).reshape(-1) + lam * shaping
 
             except Exception as e:
-
                 if not getattr(self, "_pref_add_err_once", False):
-
-                    print("[SAIL:add-pref-to-disc] WARNING: falling back to pure disc reward due to:", e)
-
+                    print("[SAIL:PBRS] WARNING: falling back to pure disc reward due to:", e)
                     self._pref_add_err_once = True
-
-    
 
         return r_gail
 

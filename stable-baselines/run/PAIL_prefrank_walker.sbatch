@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=sail_prefrew_rank_ant
+#SBATCH --job-name=sail_prefrew_rank_walker
 #SBATCH --partition=standard
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -7,12 +7,12 @@
 #SBATCH --mem=16G
 #SBATCH --time=24:00:00
 #SBATCH --array=0-3
-#SBATCH --output=/nfs/turbo/umd-sabymath/Soham/sail-tf1b/stable-baselines/run/logs/slurm_prefrew_rank_ant_%A_%a.out
-#SBATCH --error=/nfs/turbo/umd-sabymath/Soham/sail-tf1b/stable-baselines/run/logs/slurm_prefrew_rank_ant_%A_%a.err
+#SBATCH --output=/nfs/turbo/umd-sabymath/Soham/sail-tf1b/stable-baselines/run/logs/slurm_prefrew_rank_walker_%A_%a.out
+#SBATCH --error=/nfs/turbo/umd-sabymath/Soham/sail-tf1b/stable-baselines/run/logs/slurm_prefrew_rank_walker_%A_%a.err
 #SBATCH --account=sabymath0
 
 set -euo pipefail
-echo "== SAIL: Pref-Reweight + Pref-Rank (Ant) =="
+echo "== SAIL: Pref-Reweight + Pref-Rank (Walker2d) =="
 date
 hostname
 echo "JOB=$SLURM_JOB_ID TASK=$SLURM_ARRAY_TASK_ID"
@@ -22,18 +22,20 @@ REPO_ROOT=/nfs/turbo/umd-sabymath/Soham/sail-tf1b
 RUN_DIR=${REPO_ROOT}/stable-baselines/run
 VENV=$HOME/.venvs/sail-tf1b
 
-ENV_ID=Ant-v2
+ENV_ID=Walker2d-v2
 STEPS=1000000
 EPISODES=10
-SEEDS=(9 10 11 12)
+
+# Match your vanilla seed pattern (4 seeds)
+SEEDS=(2 3 4 5)
 SID=$SLURM_ARRAY_TASK_ID
 SEED=${SEEDS[$SID]}
 
-# ---------------- Ant Reward Model ----------------
-PREF_RM=/nfs/turbo/umd-sabymath/Soham/BPref/exported_models/ant_pebble_1M/reward_model_1000000_0.pt
+# ---------------- Walker2d Reward Model ----------------
+PREF_RM=/nfs/turbo/umd-sabymath/Soham/BPref/exported_models/walker2d_pebble_1M/reward_model_1000000_0.pt
 
-# ---------------- Ant Dataset ----------------
-FORCE_DATASET=${REPO_ROOT}/teacher_dataset/expert_data_no_img_Ant_scores_1200_episodes_${EPISODES}.npz
+# ---------------- Walker2d Dataset ----------------
+FORCE_DATASET=${REPO_ROOT}/teacher_dataset/expert_data_no_img_Walker2d_scores_1500_episodes_${EPISODES}.npz
 
 # ---------------- MuJoCo / GPU render ----------------
 export MUJOCO_GL=egl
@@ -60,7 +62,7 @@ if [[ ! -f "${FORCE_DATASET}" ]]; then
 fi
 
 # ---------------- Dataset symlink (safe) ----------------
-TARGET="../teacher_dataset/expert_data_no_img_Ant_scores_1200_episodes_${EPISODES}.npz"
+TARGET="../teacher_dataset/expert_data_no_img_Walker2d_scores_1500_episodes_${EPISODES}.npz"
 
 TARGET_ABS="$(readlink -f "${TARGET}" 2>/dev/null || echo "")"
 FORCE_ABS="$(readlink -f "${FORCE_DATASET}")"
@@ -73,16 +75,20 @@ fi
 echo "Resolved dataset: $(readlink -f ${TARGET})"
 
 # ---------------- Run naming ----------------
-RUN_NAME="PAIL_PrefRewRank_Ant1200_beta5_${STEPS}_s${SEED}"
+RUN_NAME="PAIL_PrefRewRank_Walker1500_beta1_${STEPS}_s${SEED}"
 
-export WANDB_PROJECT="SAIL_variants_ant"
+# NOTE: project override may be hardcoded in code; choose a walker project name for clarity
+export WANDB_PROJECT="SAIL_variants_walker2d"
 export WANDB_NAME="${RUN_NAME}"
 export WANDB_GROUP="${ENV_ID}_prefrew_rank_${STEPS}"
 
 echo "WANDB_PROJECT=${WANDB_PROJECT}"
 echo "WANDB_NAME=${WANDB_NAME}"
+echo "WANDB_GROUP=${WANDB_GROUP}"
 
 # ---------------- Training ----------------
+# IMPORTANT: Walker2d-v2 obs_dim is typically 17.
+# If your exported RM was trained with a different obs dim, change this to match.
 set -x
 PYTHONPATH="$PWD/.." python -u train_sail.py \
   --env "${ENV_ID}" \
@@ -98,8 +104,8 @@ PYTHONPATH="$PWD/.." python -u train_sail.py \
   --pref-rank-batch-size 32 \
   \
   --pref-rm "${PREF_RM}" \
-  --pref-expect-obs-dim 111 \
-  --pref-beta 5.0 \
+  --pref-expect-obs-dim 17 \
+  --pref-beta 1.0 \
   --pref-promote-quantile 0.5 \
   --pref-max-teacher-trajs 500 \
   \

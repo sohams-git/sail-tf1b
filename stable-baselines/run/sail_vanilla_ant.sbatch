@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 #SBATCH --time=48:00:00
-#SBATCH --array=0-4
+#SBATCH --array=0-3
 #SBATCH --output=/nfs/turbo/umd-sabymath/Soham/sail-tf1b/stable-baselines/run/logs/slurm_ant_vanilla_%A_%a.out
 #SBATCH --error=/nfs/turbo/umd-sabymath/Soham/sail-tf1b/stable-baselines/run/logs/slurm_ant_vanilla_%A_%a.err
 #SBATCH --account=sabymath0
@@ -38,7 +38,7 @@ VAR=vanilla
 # --------------------------------------------------
 # Seed array
 # --------------------------------------------------
-SEEDS=(0 1 2 3 4)
+SEEDS=(2 3 5 6)
 SID=$SLURM_ARRAY_TASK_ID
 
 # Safety guard

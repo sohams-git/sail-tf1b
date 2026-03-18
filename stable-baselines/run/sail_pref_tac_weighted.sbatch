@@ -6,7 +6,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=8G
 #SBATCH --time=24:00:00
-#SBATCH --array=0
+#SBATCH --array=0-4
 #SBATCH --output=/nfs/turbo/umd-sabymath/Soham/sail-tf1b/stable-baselines/run/logs/slurm_softtac_%A_%a.out
 #SBATCH --error=/nfs/turbo/umd-sabymath/Soham/sail-tf1b/stable-baselines/run/logs/slurm_softtac_%A_%a.err
 #SBATCH --account=sabymath0
@@ -24,14 +24,14 @@ VENV=$HOME/.venvs/sail-tf1b
 ENV_ID=HalfCheetah-v2
 STEPS=1000000
 EPISODES=4
-SEEDS=(6)
+SEEDS=(0 1 2 3 4)
 SEED=${SEEDS[$SLURM_ARRAY_TASK_ID]}
 
 # Offline preference RM (BPref export)
 PREF_RM=/nfs/turbo/umd-sridas/Soham/BPref/runs/halfcheetah/pebble_oracle_b500_seg50_disa_s0/exports/reward_model_ts.pt
 
 # Teacher dataset link MUST live in stable-baselines/teacher_dataset for ../teacher_dataset resolution
-ORIG_DATASET="${REPO_ROOT}/stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_500_episodes_${EPISODES}_legacy_exact.npz"
+ORIG_DATASET="${REPO_ROOT}/stable-baselines/teacher_dataset/legacy/expert_data_no_img_HalfCheetah_scores_150_episodes_${EPISODES}_legacy_exact.npz"
 TEACHER_DIR="${REPO_ROOT}/stable-baselines/teacher_dataset"
 TARGET_LINK="${TEACHER_DIR}/expert_data_no_img_HalfCheetah_scores_5600_episodes_${EPISODES}.npz"
 
@@ -56,9 +56,9 @@ ln -sfn "${ORIG_DATASET}" "${TARGET_LINK}"
 
 cd "${RUN_DIR}"
 
-RUN_NAME="SAIL_softTAC_only_${STEPS}_s${SEED}"
+RUN_NAME="SAIL_softTAC150_only_${STEPS}_s${SEED}"
 
-export WANDB_PROJECT="SAIL_variants"
+export WANDB_PROJECT="SAIL_variants_HC"
 export WANDB_NAME="${RUN_NAME}"
 export WANDB_SILENT=true
 
