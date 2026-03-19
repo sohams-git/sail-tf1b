@@ -1223,19 +1223,23 @@ class SAIL(OffPolicyRLModel):
             # ------------------- preference ranking regularizer (full episodes) -------------------
             use_hard = bool(self.config.get('pref_rank_disc', False))
             w_hard = float(self.config.get('pref_rank_weight', 0.0)) if use_hard else 0.0
+            
+            use_soft = bool(self.config.get('pref_soft_rank_disc', False))
+            w_soft = float(self.config.get('pref_soft_rank_weight', 0.0)) if use_soft else 0.0
+            
             Bp = int(self.config.get('pref_rank_batch_size', 32))
 
             # Default: disable both losses for this discriminator iter
             feed_dict.update({
                 self.discriminator.pref_loss_weight: 0.0,     # hard loss weight
-                # self.discriminator.pref_soft_weight: 0.0,     # soft loss weight (NEW) turn this on when using the disc rew for pref loss
+                self.discriminator.pref_soft_weight: 0.0,     # soft loss weight (NEW)
                 self.discriminator.pref_rm_loss_weight: 0.0,     # RM-pref loss weight
-                
-
+                self.discriminator.pref_soft_temp: float(self.config.get("pref_soft_rank_temp", 1.0)),
+    self.discriminator.pref_soft_label_ph: np.zeros((1,), dtype=np.float32),
             })
 
             # Run if either hard or soft is requested and actually weighted
-            if (w_hard > 0.0) and (self.pref_teacher_episodes is not None) and (len(self.pref_teacher_episodes) >= 2):
+            if (w_hard > 0.0 or w_soft > 0.0) and (self.pref_teacher_episodes is not None) and (len(self.pref_teacher_episodes) >= 2):
                 pair = self._sample_filtered_pref_pairs(Bp, step=step)
 
                 if pair is not None:
@@ -1274,19 +1278,21 @@ class SAIL(OffPolicyRLModel):
                     if w_hard > 0.0:
                         feed_dict.update({self.discriminator.pref_loss_weight: w_hard})
 
-                    # # -------- NEW soft loss target + weight --------
-                    # if (w_soft > 0.0) and (pos_J is not None) and (neg_J is not None):
-                    #     T = float(self.config.get('pref_soft_rank_temp', 1.0))
-                    #     T = max(T, 1e-6)
+                    # -------- NEW soft loss target + weight --------
+                    if (w_soft > 0.0) and (pos_J is not None) and (neg_J is not None):
+                        T = float(self.config.get('pref_soft_rank_temp', 1.0))
+                        eps = float(self.config.get('pref_tac_tie_eps', 0.0))
 
-                    #     # p_rm = sigmoid((Jpos - Jneg)/T)  shape [B,1]
-                    #     delta = (pos_J - neg_J) / T
-                    #     p_rm = 1.0 / (1.0 + np.exp(-delta))
+                        diff = (pos_J - neg_J).reshape(-1)
+                        y = np.zeros_like(diff)
+                        y[diff > eps] = 1.0
+                        y[diff < -eps] = -1.0
 
-                    #     feed_dict.update({
-                    #         self.discriminator.pref_soft_target_ph: p_rm.astype(np.float32),
-                    #         self.discriminator.pref_soft_weight: float(w_soft),
-                    #     })
+                        feed_dict.update({
+                            self.discriminator.pref_soft_label_ph: y.astype(np.float32),
+                            self.discriminator.pref_soft_temp: T,
+                            self.discriminator.pref_soft_weight: float(w_soft),
+                        })
 # -------------------------------------------------------------------------------------
 
             if (i == 0) and (step % 5000 == 0):  # occasional debug
