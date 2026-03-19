@@ -571,6 +571,8 @@ if __name__ == '__main__':
         help='Weight for soft ranking loss (added to discriminator total loss).')
     parser.add_argument('--pref-soft-rank-temp', type=float, default=1.0,
         help='Temperature T for soft preference target: sigma((Jpos-Jneg)/T).')
+    parser.add_argument('--pref-tac-tie-eps', type=float, default=0.0,
+        help='Tie margin epsilon for building discrete preference labels from reward model scores.')
     
 
     # ============================================================
@@ -883,6 +885,7 @@ type=int)
     config['pref_soft_rank_disc'] = bool(args.pref_soft_rank_disc)
     config['pref_soft_rank_weight'] = float(args.pref_soft_rank_weight)
     config['pref_soft_rank_temp'] = float(args.pref_soft_rank_temp)
+    config['pref_tac_tie_eps'] = getattr(args, 'pref_tac_tie_eps', 0.0)
 
     # ===========================
     # Qpref config for SAIL.td3.sail.py
